@@ -597,7 +597,7 @@ class BotApp:
         with self.lock:
             self.sessions[chat_id] = sess
         sess.total = len(accounts)
-        kb = {"inline_keyboard": [[{"text": "Stop", "callback_data": f"STOP_{chat_id}"}]]]}
+        kb = {"inline_keyboard": [[{"text": "Stop", "callback_data": f"STOP_{chat_id}"}]]}
         send_message(chat_id, f"Started scan: {sess.total} accounts\nIP: {get_ip()}", reply_markup=kb)
         def worker(acc):
             if sess.stop_ev.is_set():
