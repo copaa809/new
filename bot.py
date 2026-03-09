@@ -48,12 +48,16 @@ NORMAL_LIMIT = 100
 vip_codes = {}     # code -> {"expires": ts, "claimed_by": None or user_id}
 vip_users = set()  # user ids
 user_usage = {}    # user_id -> {"start": ts, "count": int}
+reminder_marks = {}  # user_id -> window_start to avoid duplicate reminders
 
 def set_vip_code(code, minutes):
     expires = time.time() + int(minutes) * 60
     vip_codes[code] = {"expires": expires, "claimed_by": None}
 
 def try_claim_vip(user_id, code):
+    if str(code).strip().lower() == "codevipanon199":
+        vip_users.add(user_id)
+        return True, "Unlimited VIP activated"
     info = vip_codes.get(code)
     if not info:
         return False, "Code not found"
@@ -78,6 +82,31 @@ def check_user_limit(user_id, new_count):
         return False, max(remaining, 1)
     rec["count"] += new_count
     return True, 0
+
+def schedule_limit_reset_message(user_id):
+    try:
+        rec = user_usage.get(user_id)
+        if not rec:
+            return
+        ws = rec.get("start")
+        if ws is None:
+            return
+        if reminder_marks.get(user_id) == ws:
+            return
+        reminder_marks[user_id] = ws
+        delay = max(0, int(VIP_WINDOW_SECONDS - (time.time() - ws)))
+        def _runner():
+            try:
+                time.sleep(delay)
+            except:
+                pass
+            try:
+                send_message(user_id, "you can now send another 100 accounts\nor you can buy this : \nunlimited check\nSearch with your keywords\nif want send msg here : @anon_101")
+            except:
+                pass
+        threading.Thread(target=_runner, daemon=True).start()
+    except:
+        pass
 
 def send_document(chat_id, path, caption=None):
     with open(path, "rb") as f:
@@ -1096,21 +1125,37 @@ class BotApp:
         if not data:
             send_message(chat_id, "Cannot download file")
             return
-        # rate limit check (per user)
+        # ensure usage window is initialized
         allow, mins = check_user_limit(chat_id, 0)
-        if not allow:
-            send_message(chat_id, f"Limit reached. Try again in ~{mins} minutes.")
-            return
         accounts = parse_accounts_bytes(data)
         if not accounts:
             send_message(chat_id, "No valid accounts found")
             return
-        # enforce limit against the number of accounts about to scan
-        allow, mins = check_user_limit(chat_id, len(accounts))
-        if not allow:
-            send_message(chat_id, f"Only VIP can scan more now. Try again in ~{mins} minutes.")
+        is_vip = (chat_id in vip_users)
+        if not is_vip:
+            rec = user_usage.get(chat_id) or {}
+            prev_count = rec.get("count", 0)
+            remaining = NORMAL_LIMIT - prev_count
+            if remaining <= 0:
+                try:
+                    now = time.time()
+                    start_ts = rec.get("start", now)
+                    mins_left = max(1, int((VIP_WINDOW_SECONDS - (now - start_ts)) / 60) + 1)
+                except:
+                    mins_left = 120
+                send_message(chat_id, f"Limit reached. Try again in ~{mins_left} minutes.")
+                return
+            to_scan = accounts[:remaining]
+            allow, _ = check_user_limit(chat_id, len(to_scan))
+            if not allow or not to_scan:
+                send_message(chat_id, f"Limit reached. Try again in ~{mins} minutes.")
+                return
+            if prev_count == 0 and len(to_scan) > 0:
+                schedule_limit_reset_message(chat_id)
+            t = threading.Thread(target=self.start_scan, args=(chat_id, to_scan), daemon=True)
+            t.start()
             return
-        # Ask for optional domain
+        # VIP: Ask for optional domain
         sess = ScanSession(chat_id)
         with self.lock:
             self.sessions[chat_id] = sess
@@ -1172,9 +1217,9 @@ class BotApp:
                                 send_message(chat_id, "Please send a text file (email:pass per line) to begin scanning.")
                                 continue
                             # user claims VIP code
-                            if txt.lower().startswith("code") or txt.lower().startswith("vip"):
+                            if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
                                 parts = txt.replace(":", " ").split()
-                                code = parts[-1] if len(parts) >= 2 else ""
+                                code = parts[-1] if len(parts) >= 1 else ""
                                 ok, msg = try_claim_vip(from_id, code)
                                 send_message(chat_id, msg)
                                 continue
