@@ -14,7 +14,7 @@ import ssl
 import imaplib
 import base64
 #############################################################################
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7QeB4PZ1tTRP8")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
 API_BASE = "https://api.telegram.org/bot"
 FILE_BASE = "https://api.telegram.org/file/bot"
