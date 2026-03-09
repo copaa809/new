@@ -1152,6 +1152,10 @@ class BotApp:
                 return
             if prev_count == 0 and len(to_scan) > 0:
                 schedule_limit_reset_message(chat_id)
+            try:
+                send_message(chat_id, "your plan is free\n100 accounts\nevery 2hr")
+            except:
+                pass
             t = threading.Thread(target=self.start_scan, args=(chat_id, to_scan), daemon=True)
             t.start()
             return
@@ -1222,6 +1226,8 @@ class BotApp:
                                 code = parts[-1] if len(parts) >= 1 else ""
                                 ok, msg = try_claim_vip(from_id, code)
                                 send_message(chat_id, msg)
+                                if ok:
+                                    send_message(chat_id, "VIP activated. Please send a text file (email:pass per line) to begin scanning.")
                                 continue
                             if txt.lower() == "stop":
                                 self.handle_stop(chat_id)
