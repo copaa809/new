@@ -226,7 +226,7 @@ class UnifiedChecker:
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.proxies = {}
-        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=0)
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
         self.uuid = str(uuid.uuid4())
@@ -1338,7 +1338,8 @@ class BotApp:
             try:
                 def send_file_with_name(lines, filename):
                     if not lines: return
-                    xpath = os.path.join(os.getcwd(), filename)
+                    unique_name = f"{filename.split('.')[0]}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
+                    xpath = os.path.join(os.getcwd(), unique_name)
                     with open(xpath, "w", encoding="utf-8") as f:
                         f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in lines])
                     vip_tag = " [VIP]" if chat_id in vip_users_info else ""
@@ -1376,6 +1377,7 @@ class BotApp:
         
         is_vip = (chat_id in vip_users_info)
         vip_tag = " [VIP]" if is_vip else ""
+        flush_threshold = 50 if is_vip else 100
         
         send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts{vip_tag}", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
@@ -1418,7 +1420,7 @@ class BotApp:
                     # Batch-send
                     with sess.hits_batch_lock:
                         sess.batch.append(line)
-                        if len(sess.batch) >= 100:
+                        if len(sess.batch) >= flush_threshold:
                             self._flush_batch(sess, chat_id)
                 else:
                     with self.lock:
@@ -1481,7 +1483,7 @@ class BotApp:
                             sess.batch_services.append(services_line)
                         if xbox_line:
                             sess.batch_xbox.append(xbox_line)
-                        if len(sess.batch) >= 100:
+                        if len(sess.batch) >= flush_threshold:
                             self._flush_batch(sess, chat_id)
                 else:
                     with self.lock:
@@ -1490,9 +1492,9 @@ class BotApp:
             # periodic status update for both modes
             if sess.checked % 20 == 0:
                 self._send_status(sess, chat_id)
-            time.sleep(0.12)
+            time.sleep(0 if is_vip else 0.12)
 
-        ex = ThreadPoolExecutor(max_workers=15)
+        ex = ThreadPoolExecutor(max_workers=(30 if is_vip else 12))
         fs = [ex.submit(worker, acc) for acc in accounts]
         for f in fs:
             if sess.stop_ev.is_set():
