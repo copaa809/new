@@ -1,2 +1,2 @@
 requests
-user-agent
+cloudscraper
