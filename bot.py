@@ -35,7 +35,8 @@ def get_updates(offset=None, timeout=30):
     return api("getUpdates", data)
 
 def send_message(chat_id, text, reply_markup=None):
-    if not PRIMARY_INSTANCE:
+    # Gate only group/channel sends; always reply in private/user chats
+    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
         return {"ok": True, "result": {"message_id": None}}
     data = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -43,7 +44,8 @@ def send_message(chat_id, text, reply_markup=None):
     return api("sendMessage", data)
 
 def edit_message(chat_id, message_id, text):
-    if not PRIMARY_INSTANCE:
+    # Gate only group/channel edits; always edit in private/user chats
+    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
         return {"ok": True, "result": {"message_id": message_id}}
     data = {"chat_id": chat_id, "message_id": message_id, "text": text}
     return api("editMessageText", data)
@@ -141,7 +143,8 @@ def check_vip_expiry():
 threading.Thread(target=check_vip_expiry, daemon=True).start()
 
 def send_document(chat_id, path, caption=None):
-    if not PRIMARY_INSTANCE:
+    # Gate only group/channel documents; always send to private/user chats
+    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
         return {"ok": True, "result": {"message_id": None}}
     with open(path, "rb") as f:
         files = {"document": f}
