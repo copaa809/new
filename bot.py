@@ -28,6 +28,7 @@ INSTANCE_ID = os.getenv("INSTANCE_ID", f"{socket.gethostname()}-{os.getpid()}-{u
 INSTANCE_PRIORITY = int(os.getenv("INSTANCE_PRIORITY", "1"))
 LEADER_LEASE_SECONDS = int(os.getenv("LEADER_LEASE_SECONDS", "60"))
 IS_LEADER = PRIMARY_INSTANCE
+INTRO_TEXT = "This bot for check Microsoft accounts\n\nMain channel : @anon_main1\n\nEnjoy"
 
 def api(method, data=None, files=None):
     r = requests.post(f"{API_BASE}{BOT_TOKEN}/{method}", data=data, files=files, timeout=60)
@@ -164,6 +165,21 @@ def get_my_description():
 
 def set_my_description(desc):
     return api("setMyDescription", {"description": desc})
+
+def get_leader_desc():
+    try:
+        j = api("getChat", {"chat_id": CONTROL_GROUP_ID})
+        if not j.get("ok"):
+            return ""
+        return (j.get("result") or {}).get("description") or ""
+    except:
+        return ""
+
+def set_leader_desc(desc):
+    try:
+        return api("setChatDescription", {"chat_id": CONTROL_GROUP_ID, "description": desc})
+    except:
+        return {"ok": False}
 
 def _parse_leader(desc):
     try:
@@ -1330,24 +1346,24 @@ class BotApp:
             return
         self._last_leader_tick = now
         try:
-            desc = get_my_description() or ""
+            desc = get_leader_desc() or ""
             leader, pr, exp = _parse_leader(desc) if desc else (None, 9999, 0)
             expired = exp < int(now)
             if leader and not expired:
                 if INSTANCE_PRIORITY < pr:
                     rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
-                    set_my_description(rec)
+                    set_leader_desc(rec)
                     IS_LEADER = True
                 else:
                     if leader == INSTANCE_ID:
                         rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
-                        set_my_description(rec)
+                        set_leader_desc(rec)
                         IS_LEADER = True
                     else:
                         IS_LEADER = False
             else:
                 rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
-                set_my_description(rec)
+                set_leader_desc(rec)
                 IS_LEADER = True
         except:
             IS_LEADER = PRIMARY_INSTANCE
@@ -1986,6 +2002,10 @@ class BotApp:
         if not BOT_TOKEN:
             print("Set TELEGRAM_BOT_TOKEN env")
             return
+        try:
+            set_my_description(INTRO_TEXT)
+        except:
+            pass
         try:
             drop_env = os.getenv("DROP_PENDING_UPDATES", "true").strip().lower()
             if drop_env in ("1", "true", "yes", "y", "on"):
