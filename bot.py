@@ -2002,6 +2002,9 @@ class BotApp:
         while True:
             try:
                 self._leader_tick()
+                if not IS_LEADER:
+                    time.sleep(2)
+                    continue
                 j = get_updates(self.offset, timeout=50)
                 if not j.get("ok"):
                     time.sleep(2)
@@ -2071,13 +2074,13 @@ class BotApp:
                                 continue
 
                             if txt.lower() in ("/start", "start"):
-                                send_message(chat_id, "Welcome to Q Bot\nIf you have a VIP code, send it now.\nIf you don't have a code, send the file for checking directly.")
+                                send_message(chat_id, "This bot for check Microsoft accounts\n\nMain channel : @anon_main1\n\nEnjoy")
                                 continue
                             # user claims VIP code
                             if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
                                 parts = txt.replace(":", " ").split()
                                 code = parts[-1] if len(parts) >= 1 else ""
-                                ok, msg = try_claim_vip(from_id, code)
+                                ok, msg = try_claim_vip(chat_id, code)
                                 send_message(chat_id, msg)
                                 if ok:
                                     kb = {"inline_keyboard": [[{"text": "Search", "callback_data": "VIP_SEARCH"}]]}
