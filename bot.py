@@ -17,12 +17,17 @@ import email as email_lib
 from email.header import decode_header as decode_hdr
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import socket
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7QeB4PZ1tTRP8")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
 API_BASE = "https://api.telegram.org/bot"
 FILE_BASE = "https://api.telegram.org/file/bot"
 PRIMARY_INSTANCE = os.getenv("PRIMARY_INSTANCE", "false").strip().lower() in ("1", "true", "yes", "on")
+INSTANCE_ID = os.getenv("INSTANCE_ID", f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}")
+INSTANCE_PRIORITY = int(os.getenv("INSTANCE_PRIORITY", "1"))
+LEADER_LEASE_SECONDS = int(os.getenv("LEADER_LEASE_SECONDS", "60"))
+IS_LEADER = PRIMARY_INSTANCE
 
 def api(method, data=None, files=None):
     r = requests.post(f"{API_BASE}{BOT_TOKEN}/{method}", data=data, files=files, timeout=60)
@@ -35,8 +40,7 @@ def get_updates(offset=None, timeout=30):
     return api("getUpdates", data)
 
 def send_message(chat_id, text, reply_markup=None):
-    # Gate only group/channel sends; always reply in private/user chats
-    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
+    if not IS_LEADER:
         return {"ok": True, "result": {"message_id": None}}
     data = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -44,8 +48,7 @@ def send_message(chat_id, text, reply_markup=None):
     return api("sendMessage", data)
 
 def edit_message(chat_id, message_id, text):
-    # Gate only group/channel edits; always edit in private/user chats
-    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
+    if not IS_LEADER:
         return {"ok": True, "result": {"message_id": message_id}}
     data = {"chat_id": chat_id, "message_id": message_id, "text": text}
     return api("editMessageText", data)
@@ -143,8 +146,7 @@ def check_vip_expiry():
 threading.Thread(target=check_vip_expiry, daemon=True).start()
 
 def send_document(chat_id, path, caption=None):
-    # Gate only group/channel documents; always send to private/user chats
-    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
+    if not IS_LEADER:
         return {"ok": True, "result": {"message_id": None}}
     with open(path, "rb") as f:
         files = {"document": f}
@@ -152,6 +154,30 @@ def send_document(chat_id, path, caption=None):
         if caption:
             data["caption"] = caption
         return api("sendDocument", data, files=files)
+
+def get_my_description():
+    j = api("getMyDescription", {})
+    if not j.get("ok"):
+        return ""
+    res = j.get("result") or {}
+    return res.get("description") or ""
+
+def set_my_description(desc):
+    return api("setMyDescription", {"description": desc})
+
+def _parse_leader(desc):
+    try:
+        parts = dict([tuple(p.split(":", 1)) for p in desc.split(";") if ":" in p])
+        leader = parts.get("LEADER")
+        pr = int(parts.get("PRIORITY", "9999"))
+        exp = int(parts.get("EXPIRES", "0"))
+        return leader, pr, exp
+    except:
+        return None, 9999, 0
+
+def _make_leader_record(iid, pr, ttl):
+    exp = int(time.time()) + ttl
+    return f"LEADER:{iid};PRIORITY:{pr};EXPIRES:{exp}"
 
 # ------------------- Dates and Currency Helpers (from q.py) -------------------
 from datetime import datetime
@@ -1294,6 +1320,37 @@ class BotApp:
         self.offset = None
         self.sessions = {}
         self.lock = threading.Lock()
+        self._last_leader_tick = 0
+        self._leader_desc_cache = ""
+    
+    def _leader_tick(self):
+        global IS_LEADER
+        now = time.time()
+        if now - self._last_leader_tick < 10:
+            return
+        self._last_leader_tick = now
+        try:
+            desc = get_my_description() or ""
+            leader, pr, exp = _parse_leader(desc) if desc else (None, 9999, 0)
+            expired = exp < int(now)
+            if leader and not expired:
+                if INSTANCE_PRIORITY < pr:
+                    rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
+                    set_my_description(rec)
+                    IS_LEADER = True
+                else:
+                    if leader == INSTANCE_ID:
+                        rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
+                        set_my_description(rec)
+                        IS_LEADER = True
+                    else:
+                        IS_LEADER = False
+            else:
+                rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
+                set_my_description(rec)
+                IS_LEADER = True
+        except:
+            IS_LEADER = PRIMARY_INSTANCE
     
     def _send_search_status(self, sess: ScanSession, chat_id, keywords, force=False):
         now = time.time()
@@ -1944,6 +2001,7 @@ class BotApp:
             pass
         while True:
             try:
+                self._leader_tick()
                 j = get_updates(self.offset, timeout=50)
                 if not j.get("ok"):
                     time.sleep(2)
