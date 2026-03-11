@@ -2071,10 +2071,19 @@ class BotApp:
                                             self._handle_vip_flow(chat_id, sess)
                                         else:
                                             send_message(chat_id, "Send the file to start")
+                                    else:
+                                        # proceed free if user already sent a file
+                                        sess.awaiting_vip_code = False
+                                        if sess.pending_accounts:
+                                            self._handle_free_flow(chat_id, sess)
+                                        else:
+                                            send_message(chat_id, "VIP code invalid. You can send a file to run free plan.")
                                 continue
 
                             if txt.lower() in ("/start", "start"):
                                 send_message(chat_id, "This bot for check Microsoft accounts\n\nMain channel : @anon_main1\n\nEnjoy")
+                                kb = {"inline_keyboard": [[{"text": "VIP", "callback_data": "VIP_ENTER"}]]}
+                                send_message(chat_id, "if you have code vip , click on vip and send it\n\nif dont have vip and want free , just send file", reply_markup=kb)
                                 continue
                             # user claims VIP code
                             if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
@@ -2145,6 +2154,12 @@ class BotApp:
 
                         if data.startswith("STOP_"):
                             self.handle_stop(chat_id)
+                        elif data == "VIP_ENTER":
+                            with self.lock:
+                                sess = self.sessions.get(chat_id) or ScanSession(chat_id)
+                                self.sessions[chat_id] = sess
+                            sess.awaiting_vip_code = True
+                            send_message(chat_id, "Please enter your VIP code now (or type 'cancel').")
                         elif data == "VIP_SEARCH":
                             if chat_id in vip_users_info:
                                 with self.lock:
