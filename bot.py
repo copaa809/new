@@ -22,6 +22,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7Q
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
 API_BASE = "https://api.telegram.org/bot"
 FILE_BASE = "https://api.telegram.org/file/bot"
+PRIMARY_INSTANCE = os.getenv("PRIMARY_INSTANCE", "false").strip().lower() in ("1", "true", "yes", "on")
 
 def api(method, data=None, files=None):
     r = requests.post(f"{API_BASE}{BOT_TOKEN}/{method}", data=data, files=files, timeout=60)
@@ -34,12 +35,16 @@ def get_updates(offset=None, timeout=30):
     return api("getUpdates", data)
 
 def send_message(chat_id, text, reply_markup=None):
+    if not PRIMARY_INSTANCE:
+        return {"ok": True, "result": {"message_id": None}}
     data = {"chat_id": chat_id, "text": text}
     if reply_markup:
         data["reply_markup"] = json.dumps(reply_markup)
     return api("sendMessage", data)
 
 def edit_message(chat_id, message_id, text):
+    if not PRIMARY_INSTANCE:
+        return {"ok": True, "result": {"message_id": message_id}}
     data = {"chat_id": chat_id, "message_id": message_id, "text": text}
     return api("editMessageText", data)
 
@@ -136,6 +141,8 @@ def check_vip_expiry():
 threading.Thread(target=check_vip_expiry, daemon=True).start()
 
 def send_document(chat_id, path, caption=None):
+    if not PRIMARY_INSTANCE:
+        return {"ok": True, "result": {"message_id": None}}
     with open(path, "rb") as f:
         files = {"document": f}
         data = {"chat_id": chat_id}
@@ -1839,7 +1846,7 @@ class BotApp:
                                 continue
 
                             if txt.lower() in ("/start", "start"):
-                                send_message(chat_id, "مرحبا بك في q bot\nاذا حصلت على كود vip ارسل الكود الآن\nواذا لا يوجد لديك كود ارسل الملف للفحص مباشرة")
+                                send_message(chat_id, "Welcome to Q Bot\nIf you have a VIP code, send it now.\nIf you don't have a code, send the file for checking directly.")
                                 continue
                             # user claims VIP code
                             if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
