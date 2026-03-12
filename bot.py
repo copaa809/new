@@ -5,6 +5,7 @@ import json
 import uuid
 import queue
 import threading
+import asyncio
 import requests
 import re
 import urllib.parse
@@ -19,6 +20,15 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+try:
+    import aiohttp
+    _AIOHTTP_OK = True
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp", "-q"])
+    import aiohttp
+    _AIOHTTP_OK = True
 
 # ------------------- Stealth: User-Agent rotation (from test.py) -------------------
 _STEALTH_USER_AGENTS = [
@@ -51,6 +61,179 @@ def _rand_lang() -> str:
 def _stealth_jitter(min_s=0.05, max_s=0.25):
     """Small random pause to avoid strict rate-limit fingerprinting."""
     time.sleep(random.uniform(min_s, max_s))
+
+# ==================== ASYNC PROXY MANAGER ====================
+# Sources — raw lists of http proxies
+_PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+]
+
+# Test target — fast, lightweight, just checks connectivity
+_PROXY_TEST_URL  = "https://login.live.com"
+_PROXY_TEST_TIMEOUT  = 7          # seconds per proxy
+_PROXY_CONCURRENCY   = 300        # simultaneous async checks
+_PROXY_REFRESH_SECS  = 1800       # 30 minutes
+_PROXY_SAVE_FILE     = "working_proxies.txt"
+_PROXY_MAX_KEEP      = 500        # keep the N fastest
+_PROXY_MIN_POOL      = 50         # minimum pool before scan uses proxies
+
+# Shared pool — list of "host:port" strings, fastest first
+_proxy_pool: list = []
+_proxy_pool_lock = threading.Lock()
+_proxy_last_refresh: float = 0.0
+_proxy_refresh_running = threading.Event()   # prevents double refresh
+
+def get_proxy_pool() -> list:
+    """Return a snapshot of the current working proxy pool."""
+    with _proxy_pool_lock:
+        return list(_proxy_pool)
+
+def proxy_pool_size() -> int:
+    with _proxy_pool_lock:
+        return len(_proxy_pool)
+
+def _set_proxy_pool(proxies: list):
+    global _proxy_pool, _proxy_last_refresh
+    with _proxy_pool_lock:
+        _proxy_pool = proxies
+        _proxy_last_refresh = time.time()
+    # Persist to disk
+    try:
+        with open(_PROXY_SAVE_FILE, "w") as f:
+            f.write("\n".join(proxies))
+    except Exception:
+        pass
+
+def _load_proxies_from_disk() -> list:
+    """Load last-saved proxy list on startup."""
+    try:
+        if os.path.exists(_PROXY_SAVE_FILE):
+            lines = open(_PROXY_SAVE_FILE).read().splitlines()
+            clean = [ln.strip() for ln in lines if ln.strip()]
+            return clean
+    except Exception:
+        pass
+    return []
+
+# ---------- async internals ----------
+
+async def _fetch_source(session: "aiohttp.ClientSession", url: str) -> list:
+    """Download one proxy-list source, return list of 'host:port' strings."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15),
+                               ssl=False) as r:
+            text = await r.text(errors="ignore")
+            out = []
+            for line in text.splitlines():
+                line = line.strip()
+                # Accept bare  host:port  or  http://host:port
+                line = re.sub(r'^https?://', '', line)
+                if re.match(r'^\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}$', line):
+                    out.append(line)
+            return out
+    except Exception:
+        return []
+
+async def _check_one(session: "aiohttp.ClientSession",
+                     proxy: str,
+                     results: list,
+                     semaphore: asyncio.Semaphore):
+    """Test a single proxy; append (proxy, latency) to results if working."""
+    async with semaphore:
+        proxy_url = f"http://{proxy}"
+        start = time.monotonic()
+        try:
+            async with session.get(
+                _PROXY_TEST_URL,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=_PROXY_TEST_TIMEOUT),
+                ssl=False,
+                allow_redirects=False,
+                headers={"User-Agent": _rand_ua()},
+            ) as r:
+                if r.status in (200, 301, 302, 400, 403, 404):
+                    latency = time.monotonic() - start
+                    results.append((proxy, latency))
+        except Exception:
+            pass
+
+async def _run_proxy_refresh():
+    """Full async cycle: fetch → deduplicate → test → sort → save."""
+    connector = aiohttp.TCPConnector(
+        limit=_PROXY_CONCURRENCY,
+        limit_per_host=0,
+        enable_cleanup_closed=True,
+        ssl=False,
+    )
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # 1. Fetch from all sources concurrently
+        fetch_tasks = [_fetch_source(session, url) for url in _PROXY_SOURCES]
+        fetched = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        raw: list = []
+        for batch in fetched:
+            if isinstance(batch, list):
+                raw.extend(batch)
+
+        # 2. Merge with any previously-saved proxies
+        with _proxy_pool_lock:
+            raw.extend(_proxy_pool)
+
+        unique = list(dict.fromkeys(raw))   # ordered dedup
+        print(f"[ProxyMgr] Fetched {len(unique)} unique proxies — testing...")
+
+        # 3. Test concurrently with semaphore
+        results: list = []
+        semaphore = asyncio.Semaphore(_PROXY_CONCURRENCY)
+        test_tasks = [_check_one(session, p, results, semaphore) for p in unique]
+        await asyncio.gather(*test_tasks, return_exceptions=True)
+
+    # 4. Sort by latency, keep best N
+    results.sort(key=lambda x: x[1])
+    best = [p for p, _ in results[:_PROXY_MAX_KEEP]]
+    print(f"[ProxyMgr] {len(best)} working proxies saved (from {len(unique)} tested)")
+    _set_proxy_pool(best)
+
+def _proxy_refresh_thread():
+    """Background thread: runs the async refresh loop every 30 minutes."""
+    # Load from disk immediately so checkers have proxies from the start
+    saved = _load_proxies_from_disk()
+    if saved:
+        _set_proxy_pool(saved)
+        print(f"[ProxyMgr] Loaded {len(saved)} proxies from disk")
+
+    while True:
+        _proxy_refresh_running.set()
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(_run_proxy_refresh())
+            loop.close()
+        except Exception as e:
+            print(f"[ProxyMgr] Refresh error: {e}")
+        finally:
+            _proxy_refresh_running.clear()
+        time.sleep(_PROXY_REFRESH_SECS)
+
+# Start background proxy refresh daemon on import
+threading.Thread(target=_proxy_refresh_thread, daemon=True, name="ProxyRefresh").start()
+
+def get_random_proxy() -> dict:
+    """
+    Return a requests-style proxy dict  {'http': ..., 'https': ...}
+    or empty dict if no proxies are available yet.
+    """
+    pool = get_proxy_pool()
+    if not pool:
+        return {}
+    proxy = random.choice(pool)
+    url = f"http://{proxy}"
+    return {"http": url, "https": url}
+
+# ==================== END PROXY MANAGER ====================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8650837363:AAGc7cfEhAHponP_4zTeVL7QeB4PZ1tTRP8")
 GROUP_ID = int(os.getenv("TELEGRAM_GROUP_ID", "-1002893702017"))
@@ -269,7 +452,9 @@ class UnifiedChecker:
     def __init__(self, debug=False, custom_services=None):
         self.session = requests.Session()
         self.session.trust_env = False
-        self.session.proxies = {}
+        # Inject a random working proxy if pool is ready
+        _px = get_random_proxy()
+        self.session.proxies = _px if _px else {}
         # High-performance connection pool (no retries = faster failure detection)
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=128,
